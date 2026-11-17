@@ -1,0 +1,33 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# ---- runtime artifacts (regenerated) ----
+caches/
+datasets/
+logs/
+runs_btkd/
+wandb/
+*.log
+
+# ---- model weights / checkpoints ----
+*.pth
+*.pt
+*.bin
+*.safetensors
+!pth/pretrained_pth.txt
+!segment/pth/pretrained_pth.txt
+
+# ---- third-party clone installed by install_btkd_oneclick.sh ----
+openvla/
+
+# ---- misc ----
+.DS_Store
+.idea/
+.vscode/
