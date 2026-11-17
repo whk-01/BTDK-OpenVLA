@@ -15,9 +15,10 @@
 #   训练: batch_size=4, grad_accum=4, --quantize_4bit  显存 ~10-12GB
 #
 # 注意
-#   * 导出阶段不要加 --quantize_4bit：4-bit 噪声会污染 teacher logits（见 docs §8.4）
+#   * 导出阶段不要加 --quantize_4bit：4-bit 噪声会污染 teacher logits（见 docs §9.4）
 #   * --shuffle_buffer_size 必须为 1、不要 --image_aug：否则缓存与数据集错位
-#   * 变了 --batch_size 就不要 --resume：缓存按 batch 边界续跑，batch 变了会错位
+#   * --resume 按 manifest 中实际落盘行数续写，可以更换 batch size
+#   * 完整缓存可跨 epoch 回绕并在每次回绕时重新校验 GT token；--limit 禁止回绕
 # =============================================================================
 set -Eeuo pipefail
 
@@ -172,20 +173,31 @@ do_export() {
     mkdir -p "${CACHE}"
 
     local manifest="${CACHE}/manifest.json"
-    local progress="${CACHE}/progress.json"
     local resume=""
     local overwrite=""
-    local done_samples=0
+    local done_samples=0 cache_complete=false info=""
 
-    if [[ -f "${manifest}" ]] && grep -q '"complete": *true' "${manifest}" 2>/dev/null; then
-        ok "缓存已完成（manifest complete=true），跳过导出"
-        return 0
-    fi
-    if [[ -f "${progress}" ]]; then
-        done_samples="$(awk -F'[: ,]+' '/samples_done/ {print $3}' "${progress}" | tr -dc '0-9' || echo 0)"
-        if [[ -n "${done_samples}" ]] && (( done_samples > 0 )); then
-            resume="--resume"
-            warn "检测到未完成的缓存（已写 ${done_samples} 条），将 --resume 续跑；批量大小保持 ${BS}"
+    if [[ -f "${manifest}" ]]; then
+        if ! info="$("${PY}" - "${manifest}" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+print(str(bool(m.get("complete", False))).lower(), int(m.get("n_samples", 0)))
+PY
+        )"; then
+            die "无法读取缓存 manifest: ${manifest}（文件损坏？）"
+        fi
+        read -r cache_complete done_samples <<<"${info}"
+        if [[ "${cache_complete}" == "true" ]]; then
+            ok "缓存已完成（${done_samples} 条，manifest complete=true），跳过导出"
+            return 0
+        fi
+        # An interrupted export may leave a valid manifest with zero rows.  Always
+        # resume in that case; otherwise the exporter would reject the existing manifest.
+        resume="--resume"
+        if (( done_samples > 0 )); then
+            warn "检测到未完成的缓存（已落盘 ${done_samples} 条），将 --resume 续跑"
+        else
+            warn "检测到未完成但尚无数据的缓存（manifest n_samples=0），将 --resume 从第 0 条开始"
         fi
     fi
 
@@ -231,12 +243,16 @@ do_export() {
 }
 
 do_check() {
-    step "2. 校验缓存（CPU，逐 token 对齐检查）"
+    step "2. 校验缓存统计（CPU；不加载模型/数据集）"
+    local limit_args=()
+    (( LIMIT > 0 )) && limit_args=(--limit "${LIMIT}")
     local -a cmd=("${PY}" scripts/train_btkd_student.py
         --cache_dir "${CACHE}"
         --dataset_name "${DATASET}"
         --data_root_dir "${DATA_ROOT}"
         --vla_path "${TEACHER}"
+        "${limit_args[@]}"
+        --shuffle_buffer_size 1
         --check_cache_only)
     exec_cmd "${cmd[@]}"
     if [[ "${DRY_RUN}" == "0" ]]; then ok "缓存校验通过"; fi
@@ -249,11 +265,15 @@ do_train() {
         quant=(); TRAIN_BS=1; TRAIN_GA=16
     fi
     step "3. 蒸馏训练（bs=${TRAIN_BS} x accum ${TRAIN_GA}，$( (( ${#quant[@]} > 0 )) && echo 4-bit-QLoRA || echo bf16-LoRA)）"
+    local limit_args=()
+    (( LIMIT > 0 )) && limit_args=(--limit "${LIMIT}")
     local -a cmd=("${PY}" scripts/train_btkd_student.py
         --cache_dir "${CACHE}"
         --dataset_name "${DATASET}"
         --data_root_dir "${DATA_ROOT}"
         --vla_path "${TEACHER}"
+        "${limit_args[@]}"
+        --shuffle_buffer_size 1
         --batch_size "${TRAIN_BS}"
         --grad_accumulation_steps "${TRAIN_GA}"
         "${quant[@]}"

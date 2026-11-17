@@ -1,7 +1,7 @@
 # BTKD × OpenVLA：A6 离线缓存蒸馏路线（实现说明）
 
 > 适用仓库：`/home/whk/BTKD`（BTKD 官方实现 + `openvla/`）
-> conda 环境：`BTKD`（Python 3.10.19 / PyTorch 2.5.1+cu124）
+> conda 环境：`BTKD`（Python 3.10 / PyTorch 2.5.1+cu121；cu124 需显式 `--torch-cuda 12.4`）
 > 代码位置：`btkd_vla/`、`scripts/`、`tests/`
 > 论文：Zhang et al., *Can students beyond the teacher? Distilling knowledge from teacher's bias*, AAAI 2025
 
@@ -139,8 +139,7 @@ b = cos²(π/2 · step / total_steps)
 
 | 阶段 | 内容 | 显存 |
 |---|---|---|
-| **离线导出**（一次性） | 7B teacher bf16 前向，batch 1–8 | **16–20 GB** |
-| **离线导出**（省显存） | 7B teacher 4-bit 前向 | 6–8 GB（不推荐，见 §8.4） |
+| **离线导出**（一次性） | 7B teacher bf16 前向，batch 1–2 | **16–20 GB** |
 | **训练** | 7B + LoRA(bf16)，batch 1 | **20–27 GB** |
 | **训练** | 7B + QLoRA(4-bit base)，batch 1 | **9–12 GB** |
 | 训练（小 student） | 1B 级 VLA + LoRA | 5–7 GB |
@@ -185,8 +184,16 @@ bash run_a6_single_gpu.sh train  --dataset bridge_orig   # QLoRA 蒸馏
 `--gpu 3` 指定别的卡，`--gpu auto` 挑当前最空闲的一张。
 
 导出是**一次性**开销：bridge_orig 这类 ~6 万条的集子，单卡 3090 Ti、bs=2、7B bf16 前向，
-大约 1–3 小时（tqdm 会给出 ETA）。中断了加 `--resume` 续跑，但**不要改 batch size**
-（缓存按 batch 边界续跑，改了会错位）。
+大约 1–3 小时（tqdm 会给出 ETA）。**默认只遍历数据集一遍**；RLDS 本身是无限重复流，
+必须由 `dataset_length` 或 `--limit` 指定停止点。
+
+中断后加 `--resume`：续写点取自 `manifest.json` 中**实际落盘的行数**，不是 `progress.json` 的
+近似 batch 计数。因此可以更换导出 `--batch_size`（例如 OOM 后从 2 降到 1），不会错位。
+数据流仍需从第 0 条重新读到续写点，所以恢复启动会慢一些，但不会重复写行。
+
+完整缓存训练超过一个 epoch 时可以回到 row 0 继续；batch 跨过数据集末尾时按
+`[tail..., head...]` 拼接读取，并在每次回绕时重新做 GT token 对齐校验。用 `--limit`
+导出的部分缓存、或训练时带 `--limit`，都不会自动回绕。
 
 ---
 
@@ -204,7 +211,7 @@ bash run_a6_single_gpu.sh train  --dataset bridge_orig   # QLoRA 蒸馏
 │   ├── train_btkd_student.py      # 第 3 步：LoRA/QLoRA student + BTKD loss
 │   └── smoke_test_a6.py           # CPU 全链路冒烟测试（不需要模型和数据）
 ├── tests/
-│   └── test_core.py               # 12 个单元测试（与 tool.calibrate3 逐值对齐）
+│   └── test_core.py               # 18 个单元测试（核心数学 + 缓存续写/回绕）
 └── docs/
     └── BTKD_OpenVLA_A6_离线缓存.md  # 本文档
 ```
@@ -234,7 +241,8 @@ python scripts/export_teacher_logits.py \
     --data_root_dir /data/open-x-embodiment \
     --dataset_name  bridge_orig \
     --cache_dir     caches/bridge_orig_teacher \
-    --batch_size    8 \
+    --batch_size    2 \
+    --shuffle_buffer_size 1 \
     --n_dims        7 \
     --vocab_size    32000
 ```
@@ -244,16 +252,18 @@ python scripts/export_teacher_logits.py \
 - **只做一次前向**，没有 `generate()`、没有 KV cache 增长：teacher 在 GT 动作 token 上做
   teacher-forcing，取 `logits[t-1]` 预测 `label[t]`，与 `vla-scripts/finetune.py` 的对齐方式一致。
 - `--shard_size 5000`：每 5000 条落一个 `shard_XXXXX.pt`。
-- 上面的 `--batch_size 8` 是给 A100/4090 48GB 级的；**单张 24GB 用 2**（OOM 用 1）。
-- 中断后加 `--resume` 继续（会跳过已完成的 batch，但数据流要重新读过去，慢一点但安全）。
-- 导出时 **`--image_aug` 必须关闭**（默认关闭），原因见 §7。
+- 上面的 `--batch_size 2` 是单张 24GB 卡的稳妥值（OOM 降到 1）；48GB 级卡可尝试 8。
+- 不加 `--limit` 时只导出**一遍完整数据集**；`--limit` 大于数据集长度会自动截断。
+- 中断后加 `--resume` 从 manifest 实际落盘行继续，可以更换 `--batch_size`。
+- `progress.json` 只用于观察进度，**不是**续写依据。
+- `--shuffle_buffer_size` 必须为 1，且 **`--image_aug` 必须关闭**（默认关闭），原因见 §7。
 
 导出结果：
 
 ```
 caches/bridge_orig_teacher/
 ├── manifest.json      # spec + teacher 信息 + 分片表 + complete 标记
-├── progress.json      # 断点信息
+├── progress.json      # 仅用于观察；续写点来自 manifest.json
 ├── shard_00000.pt     # {gt_token, teacher_logits(fp16), teacher_argmax_token, start}
 └── shard_00001.pt
 ```
@@ -305,6 +315,7 @@ python scripts/train_btkd_student.py \
     --max_steps 20000 --learning_rate 5e-4 \
     --lora_rank 32 \
     --temperature 4.0 --lambda_stu 0.5 \
+    --shuffle_buffer_size 1 \
     --run_root_dir runs_btkd
 ```
 
@@ -319,6 +330,7 @@ python scripts/train_btkd_student.py \
     --batch_size 1 --grad_accumulation_steps 16 \
     --max_steps 20000 --learning_rate 5e-4 \
     --lora_rank 32 --quantize_4bit \
+    --shuffle_buffer_size 1 \
     --run_root_dir runs_btkd
 ```
 
@@ -332,7 +344,7 @@ python scripts/train_btkd_student.py \
 
 1. `ce` 要持续下降（这是学生真正的任务项）
 2. `b` 按 `cos²` 从 1 掉到 0，`easy`/`hard` 两列在 `b≈0.5` 之后应该由 `hard` 主导
-3. `teacher_tok_acc` 应稳定在导出时的水平；如果逐 step 抖动极大，说明缓存与数据错位（见 §8.1）
+3. `teacher_tok_acc` 应稳定在导出时的水平；如果逐 step 抖动极大，说明缓存与数据错位（见 §7.1）
 
 产物：`runs_btkd/<exp>/final/`（PEFT adapter），可参考 `openvla/README.md` 的
 "merge LoRA" 流程合并回完整权重再部署。
@@ -349,15 +361,15 @@ python scripts/train_btkd_student.py \
 | `--schedule` | cos2 | 1→0 的余弦平方调度 |
 | `--logit_norm` | none | `none`/`center`/`std`。**teacher 和 student 同架构（LoRA）时保持 none**；若换成异构小模型，用 `std` |
 | `--renormalize_empty_branch` | 关 | 开：某分支为空时把权重让给另一个分支（偏离论文但更稳） |
-| `--verify_batches` | 5 | 前 N 个 batch 用缓存里的 GT token 校验数据顺序 |
+| `--verify_batches` | 5 | 前 N 个 batch 校验 GT token；每次 epoch 回绕也会强制校验 |
 | `--shuffle_buffer_size` | 1 | **导出与训练必须一致**，1 = 保持原始顺序 |
-| `--limit` | -1 | 只用前 N 条（调试用） |
+| `--limit` | -1 | 只用前 N 条（调试用）；会禁用缓存回绕 |
 | `--quantize_4bit` | 关 | QLoRA，省显存；训练侧 4-bit 是可接受的（只有 teacher 侧不能 4-bit） |
 | `--attn_implementation` | sdpa | 该环境未装 flash-attn，`sdpa` 是正确选择 |
 
 ---
 
-## 7. 两条硬约束（很重要）
+## 7. 三条硬约束（很重要）
 
 ### 7.1 数据顺序必须一致
 
@@ -385,6 +397,15 @@ cache/dataset misalignment at batch 3 (cache rows starting at 12).
 teacher 的图像是**离线、干净**的；student 如果开 `--image_aug`，同一帧看到的图与 teacher 不同。
 GT token 仍然一致（动作不受增强影响），所以顺序校验照样通过，但 teacher 的分布对应的是另一张图，
 easy/hard 判定会失真。默认关闭；如果你确实想用增强，请把它理解为「带噪 KD」，并降低 λ_kd。
+
+### 7.3 回绕规则
+
+- 只有**完整导出的缓存**可以在训练超过一个 epoch 后回到 row 0。
+- 若 `dataset_length % batch_size != 0`，最后一个 batch 会跨 epoch，缓存按
+  `[末尾若干行, 开头若干行]` 拼接，顺序与 RLDS 无限数据流一致。
+- 每次回绕训练脚本都会重新比对 GT token；错位会立即报错。
+- 用 `--limit` 导出的部分缓存，或训练命令带 `--limit`，都禁止回绕，避免悄悄训练到
+  用户没有请求的样本。
 
 ---
 
@@ -428,7 +449,7 @@ easy/hard 判定会失真。默认关闭；如果你确实想用增强，请把�
 
 ### 9.4 teacher 能不能 4-bit 导出？
 
-**不建议**。`calibrate3` 的转移量是 `c/(a+c+1)`，量级 O(1)，而 4-bit 量化给 logits 引入的
+**不能**。导出脚本会直接拒绝 `--quantize_4bit`。`calibrate3` 的转移量是 `c/(a+c+1)`，量级 O(1)，而 4-bit 量化给 logits 引入的
 噪声与之同量级，校准在数值上失去意义。导出阶段请用 bf16；只有**训练侧**的 student 适合 4-bit。
 
 ### 9.5 OOM
@@ -443,7 +464,7 @@ easy/hard 判定会失真。默认关闭；如果你确实想用增强，请把�
 ```bash
 conda activate BTKD && cd /home/whk/BTKD
 
-python tests/test_core.py          # 12/12 passed
+python tests/test_core.py          # 18/18 passed
 python scripts/smoke_test_a6.py    # SMOKE TEST PASSED
 ```
 
@@ -462,6 +483,12 @@ python scripts/smoke_test_a6.py    # SMOKE TEST PASSED
 | `total_loss_weighting` | `λ·CE + (1-λ)·KD` 权重正确 |
 | `extract_action_logits` | `logits[t-1]` 与 `label[t]` 对齐；label 布局错误会报错 |
 | `cache_roundtrip` | 分片写入 / 跨分片读取 / 断点续写 / fp16 精度 |
+| `cache_resume_after_abort` | 中断后按实际落盘行续写，无重复行 |
+| `cache_overwrite_removes_old_shards` | `--overwrite` 清理旧 shard/manifest，避免混入旧数据 |
+| `cache_resume_rejects_missing_shard` | 缺 shard 时拒绝续写 |
+| `cache_resume_from_empty_manifest` | 0 行 manifest 可以从 row 0 续写 |
+| `cache_window_crosses_epoch_boundary` | batch 跨 epoch 时按 `[tail, head]` 读取且保持对齐 |
+| `cache_wrap_safety` | 只有完整缓存且训练未设 `--limit` 时才允许回绕 |
 
 `scripts/smoke_test_a6.py` 跑的是完整链路：**写缓存 → 读缓存 → 300 步优化 toy student**，
 KD loss 从 `0.1231` 降到 `0.0008`，并验证了空分支行为：

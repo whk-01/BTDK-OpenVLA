@@ -22,6 +22,7 @@ Per sample we store:
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import time
@@ -34,7 +35,38 @@ from .spec import ActionSpec
 CACHE_VERSION = 1
 MANIFEST = "manifest.json"
 
-__all__ = ["LogitCacheWriter", "LogitCache", "CACHE_VERSION"]
+__all__ = ["LogitCacheWriter", "LogitCache", "cache_covers_full_epoch", "CACHE_VERSION"]
+
+
+def _meta_int(meta: Dict[str, Any], key: str, default: int = -1) -> int:
+    try:
+        value = meta.get(key, default)
+        return default if value in (None, "") else int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def cache_covers_full_epoch(
+    meta: Dict[str, Any], n_cached: int, train_limit: int = -1
+) -> bool:
+    """Whether a cache may safely wrap from its last row back to row 0.
+
+    ``train_limit > 0`` deliberately disables wrapping even when the cache itself
+    covers the whole dataset: the caller only scheduled a prefix, so silently
+    training past that prefix would violate the requested limit.
+    """
+    n_cached = int(n_cached)
+    if n_cached <= 0 or int(train_limit) > 0:
+        return False
+
+    dataset_length = _meta_int(meta, "dataset_length")
+    target_samples = _meta_int(meta, "target_samples")
+    export_limit = _meta_int(meta, "limit")
+
+    if dataset_length > 0 and target_samples > 0:
+        return target_samples == dataset_length == n_cached
+    # Backward compatibility for caches written before target_samples existed.
+    return export_limit <= 0 and dataset_length in (-1, n_cached)
 
 
 def _as_1d_long(x, name: str) -> torch.Tensor:
@@ -63,12 +95,23 @@ class LogitCacheWriter:
             raise ValueError("shard_size must be positive")
         self.meta: Dict[str, Any] = dict(meta or {})
 
+        if overwrite and resume:
+            raise ValueError("overwrite and resume cannot be used together")
         if os.path.exists(os.path.join(self.cache_dir, MANIFEST)):
             if not (overwrite or resume):
                 raise FileExistsError(
                     f"{self.cache_dir} already contains a cache; pass overwrite=True or resume=True"
                 )
         os.makedirs(self.cache_dir, exist_ok=True)
+        if overwrite:
+            self._clear_existing()
+        elif resume and not os.path.exists(os.path.join(self.cache_dir, MANIFEST)):
+            stale = glob.glob(os.path.join(self.cache_dir, "shard_*.pt"))
+            if stale:
+                raise FileNotFoundError(
+                    f"cannot resume: {self.cache_dir} contains shard files but no {MANIFEST}; "
+                    "use overwrite=True to rebuild the cache"
+                )
 
         self.shards: List[Dict[str, Any]] = []
         self.n_samples = 0
@@ -77,21 +120,77 @@ class LogitCacheWriter:
         self._buf_argmax: List[torch.Tensor] = []
         self._buf_n = 0
 
+        self.existing_meta: Dict[str, Any] = {}
         if resume and os.path.exists(os.path.join(self.cache_dir, MANIFEST)):
             self._load_existing()
 
     # ---------------------------------------------------------------- internals
+    def _clear_existing(self) -> None:
+        """Remove only files owned by this cache format."""
+        patterns = (MANIFEST, MANIFEST + ".tmp", "progress.json", "progress.json.tmp", "shard_*.pt")
+        for pattern in patterns:
+            for path in glob.glob(os.path.join(self.cache_dir, pattern)):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+
     def _load_existing(self) -> None:
-        man = json.load(open(os.path.join(self.cache_dir, MANIFEST), "r", encoding="utf-8"))
+        with open(os.path.join(self.cache_dir, MANIFEST), "r", encoding="utf-8") as f:
+            man = json.load(f)
+        if int(man.get("version", -1)) != CACHE_VERSION:
+            raise ValueError(
+                f"cannot resume: cache version {man.get('version')} != expected {CACHE_VERSION}"
+            )
         if ActionSpec.from_dict(man["spec"]) != self.spec:
             raise ValueError(
                 f"cannot resume: cached spec {man['spec']} != requested spec {self.spec.to_dict()}"
             )
         self.shards = list(man.get("shards", []))
         self.n_samples = int(man.get("n_samples", 0))
-        merged = dict(man.get("meta") or {})
+        self.existing_meta = dict(man.get("meta") or {})
+        merged = dict(self.existing_meta)
         merged.update(self.meta)
         self.meta = merged
+
+        # The manifest is the source of truth for the resume point, but verify the
+        # shard payloads too: a truncated/corrupted file must not silently append.
+        cursor = 0
+        for shard in self.shards:
+            rel = shard.get("file")
+            path = os.path.join(self.cache_dir, rel) if rel else ""
+            if not rel or not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"cannot resume: missing shard file {rel!r} in {self.cache_dir}"
+                )
+            blob = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+            try:
+                required = ("gt_token", "teacher_logits", "teacher_argmax_token")
+                missing = [key for key in required if key not in blob]
+                if missing:
+                    raise ValueError(f"missing payload keys {missing}")
+                actual_n = int(blob["gt_token"].size(0))
+                if actual_n <= 0:
+                    raise ValueError("shard has no rows")
+                if int(blob["teacher_logits"].size(0)) != actual_n:
+                    raise ValueError("teacher_logits row count differs from gt_token")
+                if int(blob["teacher_argmax_token"].size(0)) != actual_n:
+                    raise ValueError("teacher_argmax_token row count differs from gt_token")
+                if int(blob.get("start", -1)) != cursor or int(shard.get("start", -1)) != cursor:
+                    raise ValueError(
+                        f"cannot resume: shard {rel} has start {blob.get('start')}/{shard.get('start')}, expected {cursor}"
+                    )
+                if int(shard.get("n", -1)) != actual_n:
+                    raise ValueError(
+                        f"cannot resume: shard {rel} claims {shard.get('n')} rows, payload has {actual_n}"
+                    )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"cannot resume: invalid shard {rel}: {exc}") from exc
+            cursor += actual_n
+        if cursor != self.n_samples:
+            raise ValueError(
+                f"cannot resume: manifest claims {self.n_samples} samples but shards hold {cursor}"
+            )
 
     def _manifest(self, complete: bool) -> Dict[str, Any]:
         return {
@@ -192,6 +291,11 @@ class LogitCacheWriter:
         self._flush()
         self._write_manifest(complete=True)
 
+    def abort(self) -> None:
+        """Keep what reached the disk, but mark the cache unusable for training."""
+        self._flush()
+        self._write_manifest(complete=False)
+
     def __enter__(self) -> "LogitCacheWriter":
         return self
 
@@ -289,6 +393,49 @@ class LogitCache:
             "teacher_logits": torch.cat(lgs, dim=0),
             "teacher_argmax_token": torch.cat(ams, dim=0),
         }
+
+    def get_window(self, start: int, n: int, allow_wrap: bool = False):
+        """Read ``n`` consecutive rows, optionally crossing the end back to row 0.
+
+        The RLDS pipeline repeats forever, and a training batch may straddle the
+        dataset boundary when ``dataset_length % batch_size != 0``.  In that case the
+        batch contains ``[tail..., head...]``; building the same concatenation here is
+        what keeps the cached teacher logits aligned with the live student batch.
+
+        Returns ``(rows, next_start, wrapped)``.  ``wrapped`` is true only when this
+        window crosses the end of the cache.  A window larger than the whole cache is
+        rejected, because it cannot correspond to one uninterrupted dataset pass.
+        """
+        start, n = int(start), int(n)
+        if n <= 0:
+            raise ValueError(f"window size must be positive, got {n}")
+        if self.n_samples <= 0:
+            raise IndexError("cannot read a window from an empty cache")
+        if start < 0 or start >= self.n_samples:
+            raise IndexError(f"start {start} outside [0, {self.n_samples})")
+        if n > self.n_samples:
+            raise ValueError(
+                f"window size {n} exceeds cache length {self.n_samples}; "
+                "reduce --batch_size or export a larger cache"
+            )
+
+        stop = start + n
+        if stop <= self.n_samples:
+            return self.get_range(start, stop), stop, False
+        if not allow_wrap:
+            raise IndexError(
+                f"window [{start}, {stop}) crosses cache end {self.n_samples}, "
+                "but wrapping is disabled"
+            )
+
+        tail = self.get_range(start, self.n_samples)
+        head_n = stop - self.n_samples
+        head = self.get_range(0, head_n)
+        rows = {
+            key: torch.cat([tail[key], head[key]], dim=0)
+            for key in ("gt_token", "teacher_logits", "teacher_argmax_token")
+        }
+        return rows, head_n, True
 
     def shrink_to(self, n: int) -> None:
         """Logical truncation, used to align with a ``--limit`` on the dataset side."""

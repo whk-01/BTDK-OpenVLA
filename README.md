@@ -163,8 +163,8 @@ If you find this repository helpful for your research, please consider citing ou
 ## Reproducible environment (conda `BTKD`)
 
 `install_btkd_oneclick.sh` is the single, self-contained setup script: idempotent, safe to
-re-run, and machine-agnostic. It installs an environment only — it does not probe GPUs, pin
-devices or touch training settings, so the number of cards on the box does not matter.
+re-run, and machine-agnostic. It installs an environment only — it does not probe GPUs,
+query VRAM, set `CUDA_VISIBLE_DEVICES`, or touch training settings.
 
 ```bash
 bash install_btkd_oneclick.sh --env-name whk_BTKD     # full install / repair
@@ -172,70 +172,63 @@ bash install_btkd_oneclick.sh --check                 # health check only
 bash install_btkd_oneclick.sh --dry-run               # print commands, run nothing
 bash install_btkd_oneclick.sh --recreate              # delete and rebuild (dangerous)
 bash install_btkd_oneclick.sh --torch-cuda 12.4       # optional: cu124 instead of cu121
+bash install_btkd_oneclick.sh --conda-torch           # optional: use conda instead of pip
+bash install_btkd_oneclick.sh --torch-index URL       # custom PyTorch wheel index
 ```
 
 What it handles:
 
 | Problem on the server | What the script does |
 | --- | --- |
-| `solver: classic`, 30+ min solves | installs `conda-libmamba-solver`, uses `--solver=libmamba`, and persists `solver: libmamba` in `~/.condarc` (`--no-conda-config` to opt out) |
-| `CondaSSLError` on `conda.anaconda.org` | TUNA pytorch + ZJU nvidia + TUNA main, always with `--override-channels`; the nvidia mirror is probed first and can be overridden with `--nvidia-mirror` |
-| driver 535 cannot run cu124 | defaults to `--torch-cuda 12.1` (torch 2.5.1 + cu121); the script never probes or pins GPUs |
-| empty/corrupt env without `python` | detects it and reinstalls `python=3.10` + `pip` into the env |
-| pip torch shadowing conda's cu121 | detects a pip-side `torch`, uninstalls it, reinstalls from conda — also re-checks after the pip phase |
+| CUDA wheel ambiguity / wrong torch build | installs the exact `torch==2.5.1+cu121` (or `+cu124`) wheel from the PyTorch index; never silently falls back to an unspecified-CUDA PyPI wheel |
+| PyTorch download index unreachable | tries the official PyTorch index, then SJTU and NJU mirrors; a custom index can be supplied with `--torch-index` |
+| `solver: classic`, long solves in conda mode | installs `conda-libmamba-solver`, uses `--solver=libmamba`, and persists `solver: libmamba` in `~/.condarc` (`--no-conda-config` to opt out) |
+| `CondaSSLError` on `conda.anaconda.org` | default mode does not use the nvidia conda channel; optional conda mode uses override channels and a tested nvidia mirror |
+| driver 535 | defaults to cu121, which is the safe choice for a 24 GB 3090 Ti; cu124 must be requested explicitly |
+| empty/corrupt env without `python` | detects it and installs `python=3.10` + `pip` into the environment |
+| pip dependency trying to replace torch | re-checks version and CUDA after the pip phase and repairs torch using the same exact wheel index |
 | GitHub unreachable | tries the repo, then `ghfast.top` / `gh-proxy.com` / `gitclone.com` mirrors for both OpenVLA and `dlimp` |
-| CUDA 13 packages sneaking in | pins `cuda-version=<12.1|12.4>` and `numpy=1.26.4`, `mkl=2023.1.0`, `intel-openmp=2023.1.0`, `llvm-openmp<16` |
+| checks accidentally requiring a GPU | `--check` only imports packages and reports `torch.version.cuda`; it never initializes CUDA |
 
-Steps: preflight → solver/mirrors → env → PyTorch (conda) → pip deps → OpenVLA
+Steps: preflight → solver/mirrors → env → PyTorch (pip by default) → pip deps → OpenVLA
 (editable, `--no-deps`) → import self-check (`logs/env_report_*.txt`) → CPU smoke test
-(`tests/test_core.py`, `scripts/smoke_test_a6.py`, dummy cache round-trip). Torchaudio is
-installed from the conda pytorch channel, so pip never pulls a second torch build.
-A torch failure at the end makes the script exit non-zero instead of silently finishing.
+(`tests/test_core.py`, `scripts/smoke_test_a6.py`, dummy cache round-trip).
 
-Key pins: Python 3.10, torch 2.5.1 (cu121, or cu124 on newer drivers), torchvision 0.20.1,
-transformers 4.40.1, peft 0.11.1, timm 0.9.10, tensorflow 2.15.0, tfds 4.9.3, protobuf 3.20.3.
-OpenVLA is installed editable with `--no-deps`, so its `torch==2.2.0` requirement
-cannot downgrade the working environment. Logs go to `logs/oneclick_*.log`.
-Other useful flags: `--env-name`, `--torch-cuda 12.1`, `--openvla-src DIR`,
-`--skip-openvla`, `--skip-tests`, `--no-bitsandbytes`, `--download-model`.
+Key pins: Python 3.10, torch 2.5.1 + cu121, torchvision 0.20.1, torchaudio 2.5.1,
+transformers 4.40.1, peft 0.11.1, timm 0.9.10, tensorflow 2.15.0, tfds 4.9.3,
+protobuf 3.20.3. OpenVLA is installed editable with `--no-deps`, so its `torch==2.2.0`
+requirement cannot downgrade the environment. Logs go to `logs/oneclick_*.log`.
+Other useful flags: `--env-name`, `--torch-cuda 12.1`, `--torch-index URL`,
+`--openvla-src DIR`, `--skip-openvla`, `--skip-tests`, `--no-bitsandbytes`,
+`--download-model`.
 
 ### Troubleshooting: solver hangs / `CondaSSLError` on the server
 
-Two independent problems show up on machines whose conda is old and whose network
-to `conda.anaconda.org` is filtered:
+These failures only apply when PyTorch is installed through conda (`--conda-torch`) or when
+the environment itself is created. The default PyTorch path is pip and does not touch the
+nvidia conda channel.
 
 1. **`unsuccessful initial attempt using frozen solve. Retrying with flexible solve.`**
-   This text only comes from the *classic* solver. pytorch + nvidia channels make
-   classic backtracking effectively unbounded (tens of minutes, sometimes OOM).
-   Fix by using libmamba, either per command or permanently:
+   This text comes from the *classic* solver. Pytorch + nvidia channels make classic
+   backtracking effectively unbounded. Use libmamba:
 
    ```bash
    conda config --set solver libmamba
    conda config --show solver          # -> solver: libmamba
    ```
 
-   (`WARNING conda.models.version:get_matcher ... Your spec was 1.8.0.*` lines are
-   harmless deprecation noise from the classic solver parsing repodata.)
-
 2. **`CondaSSLError: ... EOF occurred in violation of protocol`** on the `nvidia`
-   channel. Use mirrors and *always* `--override-channels`, otherwise conda still
-   fetches repodata from anaconda.org. TUNA mirrors pytorch + main but **not** nvidia;
-   ZJU/XJTU mirror nvidia.
+   channel. Use mirrors and always `--override-channels`, otherwise conda still
+   fetches repodata from anaconda.org. TUNA mirrors pytorch + main but not nvidia;
+   ZJU mirrors nvidia.
 
    ```bash
-   conda install -y -n BTKD --solver=libmamba --override-channels \
-     -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch \
-     -c https://mirrors.zju.edu.cn/anaconda/cloud/nvidia \
-     -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main \
-     python=3.10 pytorch=2.5.1 torchvision=0.20.1 pytorch-cuda=12.1 \
-     cuda-version=12.1 numpy=1.26.4 mkl=2023.1.0 intel-openmp=2023.1.0 "llvm-openmp<16"
+   bash install_btkd_oneclick.sh --env-name BTKD --conda-torch \
+     --nvidia-mirror https://mirrors.zju.edu.cn/anaconda/cloud/nvidia
    ```
 
-   `install_btkd_oneclick.sh` does exactly this for both conda installs (override
-   channels + `cuda-version` pin + libmamba, and it also persists `solver: libmamba`
-   into the conda config). Pinning `cuda-version` matters: without it the solver happily
-   pulls CUDA 13.x and a pile of cu13 packages.
-   On a 535.x driver use `--torch-cuda 12.1` (cu124 wants >= 550).
+   If the nvidia channel remains unreachable, use the default pip mode. It downloads a
+   wheel that bundles the CUDA runtime and therefore does not need that channel.
 
 ## BTKD for OpenVLA (offline teacher-logit cache, "A6")
 
@@ -256,23 +249,31 @@ bash run_a6_single_gpu.sh export --dataset bridge_orig   # bs=2, auto-falls back
 bash run_a6_single_gpu.sh check  --dataset bridge_orig
 bash run_a6_single_gpu.sh train  --dataset bridge_orig   # QLoRA bs=4 x accum 4
 
-# step 1: export teacher logits (needs a bigger GPU)
+# step 1: export teacher logits once, in dataset order
+# 24 GB card: start at batch_size 2 (drop to 1 on OOM); 48 GB cards can use 8
 python scripts/export_teacher_logits.py --teacher_path openvla/openvla-7b \
     --data_root_dir /data/open-x-embodiment --dataset_name bridge_orig \
-    --cache_dir caches/bridge_orig_teacher --batch_size 8
+    --cache_dir caches/bridge_orig_teacher --batch_size 2 --shuffle_buffer_size 1
 
-# step 2: sanity-check the cache (CPU is fine)
+# step 2: sanity-check the cache (CPU only; original data path is not required)
 python scripts/train_btkd_student.py --cache_dir caches/bridge_orig_teacher \
     --dataset_name bridge_orig --check_cache_only
 
-# step 3: train the student
+# step 3: train the student (image augmentation and shuffling stay off)
 python scripts/train_btkd_student.py --cache_dir caches/bridge_orig_teacher \
     --data_root_dir /data/open-x-embodiment --dataset_name bridge_orig \
-    --batch_size 1 --grad_accumulation_steps 16 --quantize_4bit
+    --batch_size 1 --grad_accumulation_steps 16 --quantize_4bit \
+    --shuffle_buffer_size 1
 
 # CPU-only verification of the whole pipeline
 bash run_a6_smoke.sh
 ```
+
+Export semantics: without `--limit`, exactly one dataset pass is cached. If an export is
+interrupted, `--resume` continues from the rows recorded in `manifest.json` (not from the
+approximate `progress.json`), and the export batch size may be changed. A complete cache may
+wrap to row 0 for additional epochs; every wrap re-checks the cached GT action tokens. A cache
+exported or trained with `--limit` is a prefix only and never wraps silently.
 
 Full walkthrough (loss derivation, parameter table, failure modes, and the list of deliberate
 deviations from the paper): **[docs/BTKD_OpenVLA_A6_离线缓存.md](docs/BTKD_OpenVLA_A6_离线缓存.md)**.

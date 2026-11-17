@@ -15,7 +15,11 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from btkd_vla.cache import LogitCache, LogitCacheWriter  # noqa: E402
+from btkd_vla.cache import (  # noqa: E402
+    LogitCache,
+    LogitCacheWriter,
+    cache_covers_full_epoch,
+)
 from btkd_vla.core import (  # noqa: E402
     btkd_term,
     calibrate3_logits,
@@ -241,6 +245,127 @@ def test_cache_roundtrip():
             w2.add(gt[:3], lg[:3], am[:3])
         assert len(LogitCache(tmp, verbose=False)) == n + 3
         print(f"  ok  cache round-trip ({n} samples, 3 shards, resume, cross-shard reads)")
+
+
+def test_cache_resume_after_abort():
+    """An interrupted export must resume from the rows actually on disk (no duplicates)."""
+    torch.manual_seed(99)
+    n = 15
+    gt = torch.randint(SPEC.offset, SPEC.vocab_size, (n, SPEC.n_dims))
+    lg = torch.randn(n, SPEC.n_dims, SPEC.n_bins)
+    am = gt.clone()
+    with tempfile.TemporaryDirectory() as tmp:
+        w = LogitCacheWriter(tmp, SPEC, shard_size=10, meta={"dataset": "dummy"})
+        w.add(gt, lg, am)
+        w.abort()  # crash mid-export: 15 rows are on disk, manifest incomplete
+        assert not LogitCache(tmp, verbose=False).is_complete
+
+        w2 = LogitCacheWriter(tmp, SPEC, shard_size=10, resume=True, meta={"dataset": "dummy"})
+        assert w2.n_samples == n, w2.n_samples
+        assert w2.existing_meta["dataset"] == "dummy"
+        w2.add(gt[:5], lg[:5], am[:5])
+        w2.close()
+
+        c = LogitCache(tmp, verbose=False)
+        assert c.is_complete and len(c) == n + 5
+        rows = c.get_range(0, n + 5)
+        assert torch.equal(rows["gt_token"][:n], gt)
+        assert torch.equal(rows["gt_token"][n:], gt[:5])
+        print(f"  ok  cache resume after abort ({n + 5} rows, no duplication)")
+
+
+def test_cache_overwrite_removes_old_shards():
+    torch.manual_seed(100)
+    with tempfile.TemporaryDirectory() as tmp:
+        gt = torch.randint(SPEC.offset, SPEC.vocab_size, (12, SPEC.n_dims))
+        lg = torch.randn(12, SPEC.n_dims, SPEC.n_bins)
+        with LogitCacheWriter(tmp, SPEC, shard_size=5) as w:
+            w.add(gt, lg, gt)
+        assert os.path.exists(os.path.join(tmp, "shard_00002.pt"))
+
+        with LogitCacheWriter(tmp, SPEC, shard_size=5, overwrite=True) as w:
+            w.add(gt[:3], lg[:3], gt[:3])
+        c = LogitCache(tmp, verbose=False)
+        assert len(c) == 3 and len(c.shards) == 1
+        assert not os.path.exists(os.path.join(tmp, "shard_00001.pt"))
+        assert not os.path.exists(os.path.join(tmp, "shard_00002.pt"))
+        print("  ok  overwrite clears stale shards")
+
+
+def test_cache_resume_rejects_missing_shard():
+    torch.manual_seed(101)
+    with tempfile.TemporaryDirectory() as tmp:
+        gt = torch.randint(SPEC.offset, SPEC.vocab_size, (5, SPEC.n_dims))
+        lg = torch.randn(5, SPEC.n_dims, SPEC.n_bins)
+        with LogitCacheWriter(tmp, SPEC, shard_size=5) as w:
+            w.add(gt, lg, gt)
+        os.remove(os.path.join(tmp, "shard_00000.pt"))
+        try:
+            LogitCacheWriter(tmp, SPEC, shard_size=5, resume=True)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("expected FileNotFoundError for a missing shard")
+        print("  ok  resume rejects missing shard")
+
+
+def test_cache_resume_from_empty_manifest():
+    torch.manual_seed(102)
+    with tempfile.TemporaryDirectory() as tmp:
+        LogitCacheWriter(tmp, SPEC, shard_size=5, meta={"dataset": "dummy"}).abort()
+        c0 = LogitCache(tmp, verbose=False)
+        assert len(c0) == 0 and not c0.is_complete
+
+        gt = torch.randint(SPEC.offset, SPEC.vocab_size, (3, SPEC.n_dims))
+        lg = torch.randn(3, SPEC.n_dims, SPEC.n_bins)
+        with LogitCacheWriter(tmp, SPEC, shard_size=5, resume=True) as w:
+            w.add(gt, lg, gt)
+        c1 = LogitCache(tmp, verbose=False)
+        assert len(c1) == 3 and c1.is_complete
+        assert torch.equal(c1.get_range(0, 3)["gt_token"], gt)
+        print("  ok  empty manifest resumes from row 0")
+
+
+def test_cache_window_crosses_epoch_boundary():
+    """A batch may straddle the dataset boundary as [tail..., head...]."""
+    torch.manual_seed(103)
+    with tempfile.TemporaryDirectory() as tmp:
+        n = 11
+        gt = torch.randint(SPEC.offset, SPEC.vocab_size, (n, SPEC.n_dims))
+        lg = torch.randn(n, SPEC.n_dims, SPEC.n_bins)
+        with LogitCacheWriter(tmp, SPEC, shard_size=5) as w:
+            w.add(gt, lg, gt)
+        c = LogitCache(tmp, verbose=False)
+
+        rows, next_ptr, wrapped = c.get_window(9, 4, allow_wrap=True)
+        assert wrapped and next_ptr == 2
+        assert torch.equal(rows["gt_token"], torch.cat([gt[9:], gt[:2]], dim=0))
+
+        rows, next_ptr, wrapped = c.get_window(6, 5, allow_wrap=True)
+        assert not wrapped and next_ptr == n
+        assert torch.equal(rows["gt_token"], gt[6:])
+
+        try:
+            c.get_window(9, 4, allow_wrap=False)
+        except IndexError:
+            pass
+        else:
+            raise AssertionError("expected IndexError when wrapping is disabled")
+        print("  ok  cache window wraps as [tail, head] without losing alignment")
+
+
+def test_cache_wrap_safety():
+    full = {"dataset_length": 100, "target_samples": 100, "limit": -1}
+    assert cache_covers_full_epoch(full, 100, train_limit=-1)
+    assert not cache_covers_full_epoch(full, 100, train_limit=20)
+
+    partial = {"dataset_length": 100, "target_samples": 50, "limit": 50}
+    assert not cache_covers_full_epoch(partial, 50, train_limit=-1)
+
+    # --limit larger than the dataset is capped to one full pass and may wrap.
+    capped = {"dataset_length": 100, "target_samples": 100, "limit": 100000}
+    assert cache_covers_full_epoch(capped, 100, train_limit=-1)
+    print("  ok  cache wrap requires a full export and no training --limit")
 
 
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -37,7 +37,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from btkd_vla.cache import LogitCache  # noqa: E402
+from btkd_vla.cache import LogitCache, cache_covers_full_epoch  # noqa: E402
 from btkd_vla.core import (  # noqa: E402
     btkd_term,
     cosine_square_schedule,
@@ -132,16 +132,6 @@ def build_dataloader(args, processor, vla, n_bins: int):
     return loader, begin_idx, action_tokenizer
 
 
-def epoch_batches(loader):
-    """Yield ``(epoch_idx, batch)`` forever, re-iterating the loader every epoch.
-
-    RLDS loaders are infinite; re-iterating gives a clean epoch boundary so that the
-    cache pointer always restarts at row 0 together with the dataset.
-    """
-    for e in range(1_000_000):
-        for batch in loader:
-            yield e, batch
-
 def check_alignment(cached: Dict[str, torch.Tensor], gt_token: torch.Tensor, batch_idx: int, cache_ptr: int) -> None:
     """Fail loudly if the cache and the dataset have drifted out of sync."""
     a = cached["gt_token"]
@@ -159,6 +149,10 @@ def check_alignment(cached: Dict[str, torch.Tensor], gt_token: torch.Tensor, bat
 def main() -> None:
     args = build_parser().parse_args()
     torch.manual_seed(args.seed)
+    if args.image_aug:
+        raise SystemExit("--image_aug is forbidden for offline distillation: it breaks image/logit alignment")
+    if args.shuffle_buffer_size != 1:
+        raise SystemExit("--shuffle_buffer_size must be 1 for offline distillation (dataset order contract)")
 
     try:
         cache = LogitCache(args.cache_dir)
@@ -169,6 +163,17 @@ def main() -> None:
             f"cache at {args.cache_dir} is marked incomplete (interrupted export). "
             "Resume the export with --resume, or delete the directory."
         )
+    full_cache_len = len(cache)
+    cache_meta = cache.manifest.get("meta") or {}
+    cached_dataset = cache_meta.get("dataset")
+    if cached_dataset and cached_dataset != args.dataset_name:
+        raise SystemExit(
+            f"cache was exported for dataset {cached_dataset!r}, but --dataset_name is "
+            f"{args.dataset_name!r}; use the matching cache or re-export it"
+        )
+    # Decide before shrink_to(): a cache may cover the full dataset even when this
+    # training run deliberately schedules only a prefix (--limit N).
+    can_wrap_cache = cache_covers_full_epoch(cache_meta, full_cache_len, args.limit)
     if args.limit > 0:
         cache.shrink_to(min(args.limit, len(cache)))
     spec = cache.spec
@@ -182,6 +187,15 @@ def main() -> None:
             f"{stats['easy_frac'] * 100:.1f}% of action tokens go to the easy branch."
         )
         raise SystemExit(1 if bad else 0)
+
+    # Only a real training run touches the dataset, so a CPU-only cache inspection
+    # must remain usable after moving the cache to a machine with a different path.
+    cached_root = cache_meta.get("data_root_dir")
+    if cached_root and os.path.abspath(str(cached_root)) != os.path.abspath(args.data_root_dir):
+        raise SystemExit(
+            f"cache was exported from {cached_root!r}, but --data_root_dir is "
+            f"{args.data_root_dir!r}; use the matching data root or re-export it"
+        )
 
     exp = args.exp_name or (
         f"btkd+{Path(args.vla_path).name}+{args.dataset_name}"
@@ -245,24 +259,49 @@ def main() -> None:
     optimizer.zero_grad(set_to_none=True)
 
     cache_ptr = 0
-    last_epoch = -1
+    wraps = 0
     ce_hist, kd_hist, easy_hist, hard_hist, acc_hist, loss_hist = [], [], [], [], [], []
-    for step, (epoch_idx, batch) in enumerate(epoch_batches(loader)):
+    for step, batch in enumerate(loader):
         if step >= args.max_steps:
             break
 
         n = int(batch["input_ids"].size(0))
-        if epoch_idx != last_epoch:
+        wrapped = False
+        if cache_ptr == len(cache):
+            # Exact end of a pass. Restart at row 0 and verify the first batch of the
+            # new pass before training on it.
+            if not can_wrap_cache:
+                raise RuntimeError(
+                    f"cache exhausted at step {step} ({len(cache)} rows). The cache does "
+                    "not cover one full dataset pass (exported with --limit, or the dataset "
+                    "has more samples). Re-export the full dataset, or keep --limit small "
+                    "enough for the scheduled steps."
+                )
             cache_ptr = 0
-            last_epoch = epoch_idx
-        if cache_ptr + n > len(cache):
-            raise RuntimeError(
-                f"cache exhausted at step {step}: row {cache_ptr}+{n} > {len(cache)} samples. "
-                "The dataset yields more samples per epoch than the cache holds -- re-export the "
-                "full dataset, or pass --limit consistently to both stages."
-            )
+            wraps += 1
+            wrapped = True
+            print(f"[data] cache wrapped to row 0 (pass {wraps}); verifying alignment", flush=True)
 
-        cached = cache.get_range(cache_ptr, cache_ptr + n)
+        if cache_ptr + n > len(cache) and not can_wrap_cache:
+            raise RuntimeError(
+                f"cache exhausted at step {step} (row {cache_ptr}+{n} > {len(cache)}). "
+                "The cache does not cover one full dataset pass (exported with --limit, or the "
+                "dataset has more samples). Re-export the full dataset, or keep --limit small "
+                "enough for the scheduled steps."
+            )
+        window_start = cache_ptr
+        try:
+            cached, cache_ptr, crossed = cache.get_window(
+                cache_ptr, n, allow_wrap=can_wrap_cache
+            )
+        except (ValueError, IndexError) as exc:
+            raise RuntimeError(f"cannot read a cache window at step {step}: {exc}") from exc
+        if crossed:
+            # The RLDS stream repeats forever, so a batch may straddle the dataset
+            # boundary as [tail..., head...]. get_window reproduces that exact order.
+            wraps += 1
+            wrapped = True
+            print(f"[data] cache wrapped across row 0 (pass {wraps}); verifying alignment", flush=True)
         labels = batch["labels"]
 
         b = cosine_square_schedule(step, args.max_steps)
@@ -288,16 +327,14 @@ def main() -> None:
             )
             loss = total_loss(ce, kd, cfg)
 
-        if step < args.verify_batches:
-            check_alignment(cached, gt_token, step, cache_ptr)
+        if step < args.verify_batches or wrapped:
+            check_alignment(cached, gt_token, step, window_start)
 
         (loss / args.grad_accumulation_steps).backward()
         if (step + 1) % args.grad_accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-
-        cache_ptr += n
 
         loss_hist.append(float(loss.item()))
         ce_hist.append(float(ce.item()))

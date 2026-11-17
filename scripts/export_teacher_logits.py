@@ -14,7 +14,7 @@ Usage (real teacher + RLDS dataset)
         --data_root_dir /data/open-x-embodiment \
         --dataset_name bridge_orig \
         --cache_dir caches/bridge_orig_teacher \
-        --batch_size 8
+        --batch_size 2  # 24 GB card; use 8 on 48 GB cards
 
 Usage (no model, no data -- synthetic cache for smoke tests)
 ------------------------------------------------------------
@@ -42,7 +42,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from btkd_vla.cache import LogitCacheWriter  # noqa: E402
+from btkd_vla.cache import CACHE_VERSION, LogitCacheWriter  # noqa: E402
 from btkd_vla.spec import ActionSpec  # noqa: E402
 from btkd_vla.vla_glue import (  # noqa: E402
     extract_action_logits,
@@ -79,8 +79,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quantize_4bit", action="store_true", help="saves memory, contaminates logits (see docs)")
     p.add_argument("--attn_implementation", default="sdpa", choices=["sdpa", "eager", "flash_attention_2"])
 
-    p.add_argument("--resume", action="store_true", help="continue an interrupted export")
-    p.add_argument("--overwrite", action="store_true")
+    cache_mode = p.add_mutually_exclusive_group()
+    cache_mode.add_argument("--resume", action="store_true", help="continue an interrupted export")
+    cache_mode.add_argument("--overwrite", action="store_true")
     p.add_argument("--dummy", action="store_true", help="write a synthetic cache, no model/data needed")
     p.add_argument("--seed", type=int, default=42)
     return p
@@ -183,6 +184,19 @@ def write_progress(cache_dir: str, batches_done: int, samples_done: int) -> None
     os.replace(tmp, path)
 
 
+def _take_batch(batch, n: int):
+    """Keep only the first ``n`` rows of a collated batch."""
+    out = {}
+    for k, v in batch.items():
+        if torch.is_tensor(v):
+            out[k] = v[:n]
+        elif isinstance(v, dict):
+            out[k] = {kk: vv[:n] for kk, vv in v.items()}
+        else:
+            out[k] = v
+    return out
+
+
 def run_export(args, spec: ActionSpec) -> None:
     from tqdm import tqdm
 
@@ -201,9 +215,22 @@ def run_export(args, spec: ActionSpec) -> None:
     vla.eval()
 
     loader, begin_idx, dataset = build_dataloader(args, processor, vla, spec)
-    print(f"[export] dataset={args.dataset_name} length={getattr(dataset, 'dataset_length', '?')}")
+    dataset_length = int(getattr(dataset, "dataset_length", 0) or 0)
+    print(f"[export] dataset={args.dataset_name} length={dataset_length}")
 
-    progress = read_progress(args.cache_dir) if args.resume else {"batches_done": 0, "samples_done": 0}
+    # One pass over the dataset by default: the RLDS pipeline repeats forever, so an
+    # explicit stop point is what makes "export the training set" well defined.
+    if args.limit > 0:
+        target = args.limit
+    elif dataset_length > 0:
+        target = dataset_length
+    else:
+        raise SystemExit("cannot determine the dataset length; pass --limit N explicitly")
+    if args.limit > 0 and dataset_length > 0 and args.limit > dataset_length:
+        print(f"[export] --limit {args.limit} > dataset length {dataset_length}; capping")
+        target = dataset_length
+    print(f"[export] target: {target} samples (one pass)")
+
     meta = {
         "teacher": args.teacher_path,
         "teacher_dtype": args.dtype,
@@ -213,7 +240,59 @@ def run_export(args, spec: ActionSpec) -> None:
         "action_token_begin_idx": begin_idx,
         "image_aug": bool(args.image_aug),
         "shuffle_buffer_size": args.shuffle_buffer_size,
+        "dataset_length": dataset_length,
+        "limit": args.limit,
+        "target_samples": target,
     }
+
+    cache_manifest = os.path.join(args.cache_dir, "manifest.json")
+    if os.path.exists(cache_manifest) and not (args.resume or args.overwrite):
+        raise FileExistsError(
+            f"{args.cache_dir} already contains a cache; pass --resume to continue it "
+            "or --overwrite to rebuild it"
+        )
+    if args.resume and os.path.exists(cache_manifest):
+        with open(cache_manifest, "r", encoding="utf-8") as f:
+            man = json.load(f)
+        if int(man.get("version", -1)) != CACHE_VERSION:
+            raise SystemExit(
+                f"cannot resume: cache version {man.get('version')} != expected {CACHE_VERSION}"
+            )
+        try:
+            cached_spec = ActionSpec.from_dict(man["spec"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SystemExit(f"cannot resume: invalid cache spec: {exc}") from exc
+        if cached_spec != spec:
+            raise SystemExit(
+                f"cannot resume: cached spec {cached_spec.to_dict()} != requested {spec.to_dict()}"
+            )
+        old = man.get("meta") or {}
+        keys = (
+            "dataset",
+            "data_root_dir",
+            "teacher",
+            "teacher_dtype",
+            "teacher_4bit",
+            "action_token_begin_idx",
+            "image_aug",
+            "shuffle_buffer_size",
+            "dataset_length",
+            "limit",
+            "target_samples",
+        )
+        mismatched = {
+            k: (old.get(k), meta[k])
+            for k in keys
+            if k in old and old.get(k) != meta[k]
+        }
+        if mismatched:
+            raise SystemExit(
+                "cannot resume: cache was exported with different settings "
+                f"{mismatched}. Re-export with --overwrite."
+            )
+        if bool(man.get("complete", False)):
+            print(f"[export] cache already complete ({man.get('n_samples')} samples); nothing to do")
+            return
 
     writer = LogitCacheWriter(
         args.cache_dir,
@@ -224,42 +303,53 @@ def run_export(args, spec: ActionSpec) -> None:
         resume=args.resume,
     )
 
-    done_batches = int(progress["batches_done"])
-    done_samples = int(progress["samples_done"])
-    if done_batches:
-        print(f"[export] resuming after {done_samples} samples ({done_batches} batches)")
+    # Resume point comes from the manifest (rows actually on disk), never from
+    # progress.json -- the latter is written every N batches and would duplicate rows.
+    done_samples = writer.n_samples if args.resume else 0
+    if done_samples > target:
+        raise SystemExit(
+            f"cache already holds {done_samples} samples > target {target}; "
+            "re-export with --overwrite or raise --limit"
+        )
+    if done_samples:
+        print(f"[export] resuming after {done_samples} samples already on disk")
 
     it = iter(loader)
     skipped = 0
-    while skipped < done_batches:
-        next(it)
-        skipped += 1
+    pending = None
+    while skipped < done_samples:
+        batch = next(it)
+        k = int(batch["input_ids"].size(0))
+        if skipped + k <= done_samples:
+            skipped += k
+        else:
+            pending = _take_batch(batch, done_samples - skipped)
+            skipped = done_samples
+    if skipped != done_samples:
+        raise RuntimeError(
+            f"dataset ended after {skipped} samples while resuming at {done_samples}; "
+            "the dataset order/content changed, re-export with --overwrite"
+        )
+
+    def batches():
+        if pending is not None:
+            yield pending
+        yield from it
 
     total_written = done_samples
-    batches_written = done_batches
+    batches_written = 0
     scalar_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
-    pbar = tqdm(unit="samples", desc="export")
+    pbar = tqdm(total=target, initial=done_samples, unit="samples", desc="export")
     ok = False
     try:
-        for batch in it:
-            n = int(batch["input_ids"].size(0))
-            if args.limit > 0 and total_written + n > args.limit:
-                n = args.limit - total_written
-                if n <= 0:
-                    break
-                batch = {
-                    k: (
-                        v[:n]
-                        if torch.is_tensor(v)
-                        else {kk: vv[:n] for kk, vv in v.items()}
-                        if isinstance(v, dict)
-                        else v
-                    )
-                    for k, v in batch.items()
-                }
-            if args.limit > 0 and total_written >= args.limit:
+        for batch in batches():
+            if total_written >= target:
                 break
+            n = int(batch["input_ids"].size(0))
+            if total_written + n > target:
+                n = target - total_written
+                batch = _take_batch(batch, n)
 
             use_amp = args.device.startswith("cuda") and scalar_dtype != torch.float32
             with torch.inference_mode(), torch.autocast("cuda", dtype=scalar_dtype, enabled=use_amp):
@@ -280,17 +370,13 @@ def run_export(args, spec: ActionSpec) -> None:
             pbar.update(n)
             if batches_written % 50 == 0:
                 write_progress(args.cache_dir, batches_written, total_written)
-            if args.limit > 0 and total_written >= args.limit:
-                break
         ok = True
     finally:
         pbar.close()
         if ok:
             writer.close()
         else:
-            # keep the partial shards but mark the cache as incomplete so the trainer refuses it
-            writer._flush()
-            writer._write_manifest(complete=False)
+            writer.abort()
         write_progress(args.cache_dir, batches_written, total_written)
 
     print(f"[export] done: {total_written} samples -> {args.cache_dir}")
@@ -299,6 +385,15 @@ def run_export(args, spec: ActionSpec) -> None:
 def main() -> None:
     args = build_parser().parse_args()
     spec = ActionSpec(n_bins=args.n_bins, n_dims=args.n_dims, vocab_size=args.vocab_size)
+    if args.quantize_4bit:
+        raise SystemExit(
+            "--quantize_4bit is forbidden for teacher export: 4-bit noise corrupts the "
+            "BTKD calibration target. Export the teacher in bf16/fp16."
+        )
+    if args.image_aug:
+        raise SystemExit("--image_aug is forbidden for offline distillation: it breaks image/logit alignment")
+    if args.shuffle_buffer_size != 1:
+        raise SystemExit("--shuffle_buffer_size must be 1 for offline distillation (dataset order contract)")
     if args.dummy:
         write_dummy_cache(args, spec)
         return
