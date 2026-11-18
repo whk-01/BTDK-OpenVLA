@@ -213,6 +213,30 @@ def test_extract_action_logits():
     print("  ok  extract_action_logits aligns logits[t-1] with label[t]")
 
 
+def test_extract_action_logits_with_visual_prefix():
+    """The VLM inserts 256 visual tokens after BOS; labels must be shifted the same way."""
+    b, text_l, n_visual, v, d = 2, 20, 256, 32000, 7
+    logits = torch.randn(b, text_l + n_visual, v)
+    labels = torch.full((b, text_l), -100, dtype=torch.long)
+    action_start = text_l - d  # last 7 text positions are action tokens
+    gt = torch.randint(SPEC.offset, SPEC.vocab_size, (b, d))
+    labels[:, action_start:] = gt
+
+    # multimodal layout: [BOS] + 256 visual tokens + text[1:]
+    shifted_start = action_start + n_visual
+    for i in range(b):
+        for j in range(d):
+            logits[i, shifted_start + j - 1, int(gt[i, j])] = 50.0
+
+    action_logits, gt_tok, argmax_tok = extract_action_logits(
+        logits, labels, SPEC.offset - 1, SPEC
+    )
+    assert action_logits.shape == (b, d, 256)
+    assert torch.equal(gt_tok, gt)
+    assert torch.equal(argmax_tok, gt)
+    print("  ok  extract_action_logits handles OpenVLA's visual-token prefix")
+
+
 def test_cache_roundtrip():
     torch.manual_seed(1234)
     with tempfile.TemporaryDirectory() as tmp:

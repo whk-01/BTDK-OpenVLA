@@ -135,6 +135,10 @@ def extract_action_logits(
     ``t - 1`` predicts the token at position ``t``; that is exactly the alignment used
     by ``vla-scripts/finetune.py``.
 
+    ``logits`` may be longer than ``labels`` because OpenVLA inserts the projected
+    visual patch embeddings after the first text token.  The function reconstructs
+    that layout internally, so callers can pass the collator's text-only labels.
+
     Returns:
         action_logits       [B, D, n_bins]  (fp32, last-n_bins slice, ascending token id)
         gt_token            [B, D]          int64
@@ -142,8 +146,23 @@ def extract_action_logits(
     """
     if logits.dim() != 3:
         raise ValueError(f"logits must be [B, L, V], got {tuple(logits.shape)}")
-    if labels.shape != logits.shape[:2]:
+    if labels.dim() != 2 or labels.size(0) != logits.size(0):
         raise ValueError(f"labels {tuple(labels.shape)} vs logits {tuple(logits.shape)}")
+
+    # OpenVLA is a multimodal model: `modeling_prismatic.forward()` inserts the
+    # projected visual patch embeddings *after the first text token*, so the logits
+    # sequence is longer than the collator's text-only labels.  Rebuild the same
+    # layout here: [label[0], IGNORE_INDEX x n_visual_tokens, label[1:]].
+    if labels.size(1) != logits.size(1):
+        n_visual = logits.size(1) - labels.size(1)
+        if n_visual < 0:
+            raise ValueError(
+                f"labels {tuple(labels.shape)} longer than logits {tuple(logits.shape)}"
+            )
+        visual_ignore = torch.full(
+            (labels.size(0), n_visual), -100, dtype=labels.dtype, device=labels.device
+        )
+        labels = torch.cat([labels[:, :1], visual_ignore, labels[:, 1:]], dim=1)
 
     mask = labels > int(action_token_begin_idx)
     per_row = mask.sum(dim=1)
