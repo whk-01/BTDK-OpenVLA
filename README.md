@@ -264,6 +264,27 @@ python -m pip install "tensorflow==2.15.0" "tensorflow_datasets==4.9.3" \
   "tensorflow-metadata==1.15.0" "protobuf==3.20.3"
 ```
 
+### Troubleshooting: `ModuleNotFoundError: No module named 'tensorflow_graphics'`
+
+OpenVLA imports `tensorflow_graphics.geometry.transformation` while loading the RLDS/OXE
+dataset registry, even for LIBERO. Install it **without dependencies**: its package metadata
+pulls `tensorflow-addons`, `OpenEXR`, `trimesh`, etc., which are not needed for this import
+and often fail to build.
+
+```bash
+python -m pip install --no-deps "tensorflow_graphics==2021.12.3"
+
+python - <<'INNER'
+import tensorflow_graphics
+import tensorflow_graphics.geometry.transformation as tfg
+print("tensorflow_graphics:", tensorflow_graphics.__version__)
+print("transformation   :", tfg.__file__)
+INNER
+```
+
+The one-click installer now installs `tensorflow_graphics` with `--no-deps` and checks it in
+the final self-test.
+
 ## BTKD for OpenVLA (offline teacher-logit cache, "A6")
 
 `openvla/` is cloned into this repo and installed into the same `BTKD` conda environment,

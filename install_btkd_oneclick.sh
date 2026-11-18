@@ -464,8 +464,11 @@ if [[ "${CHECK_ONLY}" == "0" ]]; then
     pip_install \
         "tensorflow==2.15.0" \
         "tensorflow_datasets==4.9.3" \
-        "tensorflow_graphics==2021.12.3" \
         "tensorflow-metadata==1.15.0"
+
+    # tensorflow_graphics 的元数据会拉 tensorflow-addons/OpenEXR 等无关重依赖。
+    # OpenVLA 只用 geometry.transformation，实际需要 TF/numpy/six/absl，故 --no-deps。
+    pip_install --no-deps "tensorflow_graphics==2021.12.3"
 
     if [[ "${DRY_RUN}" != "1" ]] && "${PY}" -c "import dlimp" >/dev/null 2>&1; then
         ok "dlimp 已安装"
@@ -604,6 +607,7 @@ if [[ "${DRY_RUN}" == "0" ]]; then
     verify "timm"          'import timm;print(timm.__version__)' || FAILS=$((FAILS+1))
     verify "tensorflow"    'import os;os.environ["TF_CPP_MIN_LOG_LEVEL"]="3";import tensorflow as tf;print(tf.__version__)' || FAILS=$((FAILS+1))
     verify "tfds"          'import os;os.environ["TF_CPP_MIN_LOG_LEVEL"]="3";import tensorflow_datasets as tfds;print(tfds.__version__)' || FAILS=$((FAILS+1))
+    verify "tfg"           'import tensorflow_graphics as tfg;print(tfg.__version__)' || FAILS=$((FAILS+1))
     verify "dlimp"         'import dlimp;print(getattr(dlimp,"__version__","ok"))' || FAILS=$((FAILS+1))
     verify "prismatic"     'import prismatic;print(prismatic.__file__)' || FAILS=$((FAILS+1))
     verify "protobuf"      'import google.protobuf as p;print(p.__version__)' || FAILS=$((FAILS+1))
