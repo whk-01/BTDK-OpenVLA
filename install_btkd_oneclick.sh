@@ -473,10 +473,13 @@ if [[ "${CHECK_ONLY}" == "0" ]]; then
         DLIMP_OK=0
         for pre in "" "https://ghfast.top/" "https://gh-proxy.com/"; do
             url="git+${pre}https://github.com/moojink/dlimp_openvla"
-            if pip_install "dlimp @ ${url}"; then DLIMP_OK=1; break; fi
+            if pip_install --no-deps "dlimp @ ${url}"; then DLIMP_OK=1; break; fi
             warn "dlimp 安装失败：${url}"
         done
-        (( DLIMP_OK == 1 )) || warn "dlimp 未装上；OpenVLA 的 RLDS 训练会用到它"
+        if (( DLIMP_OK == 0 )); then
+            die "dlimp 未装上（OpenVLA 的硬依赖）。手动安装：
+  ${PY} -m pip install --no-deps 'dlimp @ git+https://ghfast.top/https://github.com/moojink/dlimp_openvla'"
+        fi
     fi
 
     # 兜底：防止被上游依赖顺带升级
@@ -601,6 +604,8 @@ if [[ "${DRY_RUN}" == "0" ]]; then
     verify "timm"          'import timm;print(timm.__version__)' || FAILS=$((FAILS+1))
     verify "tensorflow"    'import os;os.environ["TF_CPP_MIN_LOG_LEVEL"]="3";import tensorflow as tf;print(tf.__version__)' || FAILS=$((FAILS+1))
     verify "tfds"          'import os;os.environ["TF_CPP_MIN_LOG_LEVEL"]="3";import tensorflow_datasets as tfds;print(tfds.__version__)' || FAILS=$((FAILS+1))
+    verify "dlimp"         'import dlimp;print(getattr(dlimp,"__version__","ok"))' || FAILS=$((FAILS+1))
+    verify "prismatic"     'import prismatic;print(prismatic.__file__)' || FAILS=$((FAILS+1))
     verify "protobuf"      'import google.protobuf as p;print(p.__version__)' || FAILS=$((FAILS+1))
     verify "btkd_vla"      'import sys;sys.path.insert(0,"'"${SCRIPT_DIR}"'");import btkd_vla;print(btkd_vla.__file__)' || FAILS=$((FAILS+1))
     if [[ "${SKIP_OPENVLA}" != "1" ]]; then

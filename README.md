@@ -230,6 +230,40 @@ nvidia conda channel.
    If the nvidia channel remains unreachable, use the default pip mode. It downloads a
    wheel that bundles the CUDA runtime and therefore does not need that channel.
 
+### Troubleshooting: `ModuleNotFoundError: No module named 'dlimp'`
+
+`dlimp` is a hard dependency of OpenVLA (`prismatic.vla`), but OpenVLA itself is installed
+with `--no-deps`, so `dlimp` must be installed separately. The one-click installer now does
+this and verifies both `dlimp` and `prismatic` during self-check. To repair an existing env:
+
+```bash
+conda activate whk_BTKD
+cd /path/to/BTDK-OpenVLA
+
+python -m pip install --no-deps \
+  "dlimp @ git+https://ghfast.top/https://github.com/moojink/dlimp_openvla"
+
+python -c "import dlimp, prismatic; print(dlimp.__file__); print(prismatic.__file__)"
+```
+
+Use the `moojink/dlimp_openvla` fork, not the PyPI `dlimp` package. If `git+https` is
+blocked, download the source archive through the same mirror and install the directory:
+
+```bash
+wget -O /tmp/dlimp_openvla.tar.gz \
+  https://ghfast.top/https://github.com/moojink/dlimp_openvla/archive/refs/heads/main.tar.gz
+tar -xzf /tmp/dlimp_openvla.tar.gz -C /tmp
+python -m pip install --no-deps /tmp/dlimp_openvla-main
+```
+
+`dlimp` also needs `tensorflow==2.15.0` and `tensorflow_datasets>=4.9.2`; the one-click
+installer installs both. If they are missing:
+
+```bash
+python -m pip install "tensorflow==2.15.0" "tensorflow_datasets==4.9.3" \
+  "tensorflow-metadata==1.15.0" "protobuf==3.20.3"
+```
+
 ## BTKD for OpenVLA (offline teacher-logit cache, "A6")
 
 `openvla/` is cloned into this repo and installed into the same `BTKD` conda environment,
