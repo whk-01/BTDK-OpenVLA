@@ -37,7 +37,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from btkd_vla.cache import LogitCache, cache_covers_full_epoch  # noqa: E402
+from btkd_vla.cache import DATA_ORDER, LogitCache, cache_covers_full_epoch  # noqa: E402
 from btkd_vla.core import (  # noqa: E402
     btkd_term,
     cosine_square_schedule,
@@ -102,7 +102,9 @@ def build_dataloader(args, processor, vla, n_bins: int):
     from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
     from prismatic.util.data_utils import PaddedCollatorForActionPrediction
     from prismatic.vla.action_tokenizer import ActionTokenizer
-    from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
+    from prismatic.vla.datasets import RLDSBatchTransform
+
+    from btkd_vla.rlds_dataset import DeterministicSingleRLDSDataset
 
     action_tokenizer = ActionTokenizer(processor.tokenizer, bins=n_bins)
     begin_idx = action_tokenizer.action_token_begin_idx
@@ -115,12 +117,13 @@ def build_dataloader(args, processor, vla, n_bins: int):
         if "v01" not in args.vla_path
         else VicunaV15ChatPromptBuilder,
     )
-    dataset = RLDSDataset(
+    dataset = DeterministicSingleRLDSDataset(
         args.data_root_dir,
         args.dataset_name,
         batch_transform,
         resize_resolution=tuple(vla.config.image_sizes),
-        shuffle_buffer_size=max(1, args.shuffle_buffer_size),
+        shuffle_buffer_size=args.shuffle_buffer_size,
+        train=True,
         image_aug=args.image_aug,
     )
     collator = PaddedCollatorForActionPrediction(
@@ -141,8 +144,9 @@ def check_alignment(cached: Dict[str, torch.Tensor], gt_token: torch.Tensor, bat
             f"cache/dataset misalignment at batch {batch_idx} (cache rows starting at {cache_ptr}).\n"
             f"  cached : {a[:2, :4].tolist()} ...\n"
             f"  dataset: {b[:2, :4].tolist()} ...\n"
-            "Both runs must iterate the dataset with identical --shuffle_buffer_size and "
-            "--image_aug settings (a fresh export with the default shuffle_buffer_size=1 fixes this)."
+            "Export and training must both use the deterministic A6 RLDS loader "
+            "(TFDS shard shuffling off, one read/map worker) and the same dataset. "
+            "Re-export the cache with the current code."
         )
 
 
@@ -170,6 +174,13 @@ def main() -> None:
         raise SystemExit(
             f"cache was exported for dataset {cached_dataset!r}, but --dataset_name is "
             f"{args.dataset_name!r}; use the matching cache or re-export it"
+        )
+    cached_order = cache_meta.get("data_order")
+    if cached_order != DATA_ORDER:
+        raise SystemExit(
+            f"cache data order is {cached_order!r}, expected {DATA_ORDER!r}. "
+            "This cache predates deterministic RLDS ordering; re-export it with "
+            "scripts/export_teacher_logits.py --overwrite."
         )
     # Decide before shrink_to(): a cache may cover the full dataset even when this
     # training run deliberately schedules only a prefix (--limit N).

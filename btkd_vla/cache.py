@@ -32,10 +32,17 @@ import torch
 
 from .spec import ActionSpec
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 MANIFEST = "manifest.json"
+DATA_ORDER = "deterministic_single_rlds_v1"
 
-__all__ = ["LogitCacheWriter", "LogitCache", "cache_covers_full_epoch", "CACHE_VERSION"]
+__all__ = [
+    "LogitCacheWriter",
+    "LogitCache",
+    "cache_covers_full_epoch",
+    "CACHE_VERSION",
+    "DATA_ORDER",
+]
 
 
 def _meta_int(meta: Dict[str, Any], key: str, default: int = -1) -> int:

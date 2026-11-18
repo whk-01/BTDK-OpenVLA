@@ -16,8 +16,10 @@
 #
 # 注意
 #   * 导出阶段不要加 --quantize_4bit：4-bit 噪声会污染 teacher logits（见 docs §9.4）
+#   * A6 使用确定性 RLDS 顺序（TFDS 分片不 shuffle、读/map 各 1 个 worker）
 #   * --shuffle_buffer_size 必须为 1、不要 --image_aug：否则缓存与数据集错位
 #   * --resume 按 manifest 中实际落盘行数续写，可以更换 batch size
+#   * 旧版缓存（CACHE_VERSION/data_order 不匹配）会自动备份为 *.legacy_时间戳 后重导
 #   * 完整缓存可跨 epoch 回绕并在每次回绕时重新校验 GT token；--limit 禁止回绕
 # =============================================================================
 set -Eeuo pipefail
@@ -176,28 +178,63 @@ do_export() {
     local resume=""
     local overwrite=""
     local done_samples=0 cache_complete=false info=""
+    local cache_version=-1 cache_order="" same_dataset=false same_root=false
 
     if [[ -f "${manifest}" ]]; then
-        if ! info="$("${PY}" - "${manifest}" <<'PY'
-import json, sys
+        if ! info="$("${PY}" - "${manifest}" "${DATASET}" "${DATA_ROOT}" <<'PY'
+import json, os, sys
+from btkd_vla.cache import CACHE_VERSION, DATA_ORDER
+
 m = json.load(open(sys.argv[1], encoding="utf-8"))
-print(str(bool(m.get("complete", False))).lower(), int(m.get("n_samples", 0)))
+meta = m.get("meta") or {}
+print("\t".join([
+    str(bool(m.get("complete", False))).lower(),
+    str(int(m.get("n_samples", 0))),
+    str(int(m.get("version", -1))),
+    str(meta.get("data_order", "")),
+    str(meta.get("dataset") == sys.argv[2]).lower(),
+    str(os.path.abspath(str(meta.get("data_root_dir", ""))) == os.path.abspath(sys.argv[3])).lower(),
+    str(CACHE_VERSION),
+    DATA_ORDER,
+]))
 PY
         )"; then
             die "无法读取缓存 manifest: ${manifest}（文件损坏？）"
         fi
-        read -r cache_complete done_samples <<<"${info}"
-        if [[ "${cache_complete}" == "true" ]]; then
-            ok "缓存已完成（${done_samples} 条，manifest complete=true），跳过导出"
-            return 0
+        local expected_version expected_order
+        IFS=$'\t' read -r cache_complete done_samples cache_version cache_order \
+            same_dataset same_root expected_version expected_order <<<"${info}"
+
+        if [[ "${same_dataset}" != "true" ]]; then
+            die "缓存属于另一个数据集，拒绝覆盖: ${manifest}。请换 --cache 路径或手动处理旧缓存。"
         fi
-        # An interrupted export may leave a valid manifest with zero rows.  Always
-        # resume in that case; otherwise the exporter would reject the existing manifest.
-        resume="--resume"
-        if (( done_samples > 0 )); then
-            warn "检测到未完成的缓存（已落盘 ${done_samples} 条），将 --resume 续跑"
+        if [[ "${same_root}" != "true" ]]; then
+            die "缓存的数据根目录与当前 --data-root 不一致，拒绝覆盖: ${manifest}。请换 --cache 路径或手动处理旧缓存。"
+        fi
+
+        if [[ "${cache_version}" != "${expected_version}" || "${cache_order}" != "${expected_order}" ]]; then
+            local backup="${CACHE}.legacy_$(date +%Y%m%d_%H%M%S)"
+            warn "旧缓存格式/顺序不兼容（version=${cache_version}, data_order=${cache_order:-<empty>}）"
+            if [[ "${DRY_RUN}" == "1" ]]; then
+                warn "[dry-run] 将把旧缓存备份到: ${backup}，然后重新导出"
+            else
+                mv "${CACHE}" "${backup}"
+                mkdir -p "${CACHE}"
+                ok "旧缓存已备份到: ${backup}"
+            fi
+            overwrite="--overwrite"
+        elif [[ "${cache_complete}" == "true" ]]; then
+            ok "缓存已完成（${done_samples} 条，确定性顺序，manifest complete=true），跳过导出"
+            return 0
         else
-            warn "检测到未完成但尚无数据的缓存（manifest n_samples=0），将 --resume 从第 0 条开始"
+            # An interrupted export may leave a valid manifest with zero rows. Always
+            # resume in that case; otherwise the exporter would reject the manifest.
+            resume="--resume"
+            if (( done_samples > 0 )); then
+                warn "检测到未完成的缓存（已落盘 ${done_samples} 条），将 --resume 续跑"
+            else
+                warn "检测到未完成但尚无数据的缓存（manifest n_samples=0），将 --resume 从第 0 条开始"
+            fi
         fi
     fi
 

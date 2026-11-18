@@ -304,7 +304,8 @@ bash run_a6_single_gpu.sh export --dataset bridge_orig   # bs=2, auto-falls back
 bash run_a6_single_gpu.sh check  --dataset bridge_orig
 bash run_a6_single_gpu.sh train  --dataset bridge_orig   # QLoRA bs=4 x accum 4
 
-# step 1: export teacher logits once, in dataset order
+# step 1: export teacher logits once, in deterministic dataset order
+# (uses btkd_vla/rlds_dataset.py: TFDS shard shuffle off, single read/map worker)
 # 24 GB card: start at batch_size 2 (drop to 1 on OOM); 48 GB cards can use 8
 python scripts/export_teacher_logits.py --teacher_path openvla/openvla-7b \
     --data_root_dir /data/open-x-embodiment --dataset_name bridge_orig \
@@ -329,6 +330,13 @@ interrupted, `--resume` continues from the rows recorded in `manifest.json` (not
 approximate `progress.json`), and the export batch size may be changed. A complete cache may
 wrap to row 0 for additional epochs; every wrap re-checks the cached GT action tokens. A cache
 exported or trained with `--limit` is a prefix only and never wraps silently.
+
+Cache order contract: export and training both use `DeterministicSingleRLDSDataset`, which
+disables TFDS shard-file shuffling and pins all RLDS read/map/flatten parallelism to 1.
+`--shuffle_buffer_size 1` and `--image_aug` off are still required but are **not** sufficient
+on their own (upstream `RLDSDataset` still shuffles shards across processes). Caches whose
+manifest lacks `data_order=deterministic_single_rlds_v1` must be re-exported;
+`run_a6_single_gpu.sh export` backs them up to `*.legacy_<timestamp>` and re-exports automatically.
 
 Full walkthrough (loss derivation, parameter table, failure modes, and the list of deliberate
 deviations from the paper): **[docs/BTKD_OpenVLA_A6_离线缓存.md](docs/BTKD_OpenVLA_A6_离线缓存.md)**.

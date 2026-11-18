@@ -23,10 +23,12 @@ Usage (no model, no data -- synthetic cache for smoke tests)
 
 Ordering contract
 -----------------
-Rows are appended in dataset order.  Both this script and the trainer must iterate
-the dataset identically (``--shuffle_buffer_size 1`` -> identity order, image
-augmentation OFF).  The trainer re-checks every batch against the cached ground-truth
-tokens, so any drift fails loudly instead of silently corrupting the distillation.
+Rows are appended in dataset order.  This script and the trainer share
+``btkd_vla.rlds_dataset.DeterministicSingleRLDSDataset``, which disables TFDS shard-file
+shuffling and pins every RLDS read/map/flatten parallelism to 1.  A frame shuffle buffer
+of 1 and image augmentation OFF are additional requirements.  The trainer re-checks every
+batch against the cached ground-truth tokens, so any drift fails loudly instead of
+silently corrupting the distillation.
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from btkd_vla.cache import CACHE_VERSION, LogitCacheWriter  # noqa: E402
+from btkd_vla.cache import CACHE_VERSION, DATA_ORDER, LogitCacheWriter  # noqa: E402
 from btkd_vla.spec import ActionSpec  # noqa: E402
 from btkd_vla.vla_glue import (  # noqa: E402
     extract_action_logits,
@@ -67,7 +69,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--shard_size", type=int, default=5000, help="samples per shard file")
     p.add_argument("--limit", type=int, default=-1, help="stop after N samples (-1 = all)")
-    p.add_argument("--shuffle_buffer_size", type=int, default=1, help="keep at 1 to preserve order")
+    p.add_argument(
+        "--shuffle_buffer_size",
+        type=int,
+        default=1,
+        help="must stay 1; the A6 loader additionally disables TFDS shard-file shuffling",
+    )
     p.add_argument("--image_aug", action="store_true", help="DO NOT use for offline KD (breaks alignment)")
 
     p.add_argument("--vocab_size", type=int, default=32000, help="LLM vocab size (Llama-2 = 32000)")
@@ -98,7 +105,16 @@ def write_dummy_cache(args, spec: ActionSpec) -> None:
     with LogitCacheWriter(
         args.cache_dir,
         spec,
-        meta={"dummy": True, "teacher": "synthetic", "teacher_token_acc": teacher_acc},
+        meta={
+            "dummy": True,
+            "dataset": args.dataset_name or "dummy",
+            "teacher": "synthetic",
+            "teacher_token_acc": teacher_acc,
+            "data_order": DATA_ORDER,
+            "rlds_shard_shuffle": False,
+            "rlds_num_parallel_reads": 1,
+            "rlds_num_parallel_calls": 1,
+        },
         shard_size=args.shard_size,
         overwrite=True,
     ) as w:
@@ -130,7 +146,9 @@ def build_dataloader(args, processor, vla, spec: ActionSpec):
     from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
     from prismatic.util.data_utils import PaddedCollatorForActionPrediction
     from prismatic.vla.action_tokenizer import ActionTokenizer
-    from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
+    from prismatic.vla.datasets import RLDSBatchTransform
+
+    from btkd_vla.rlds_dataset import DeterministicSingleRLDSDataset
 
     action_tokenizer = ActionTokenizer(processor.tokenizer, bins=spec.n_bins)
     begin_idx = action_tokenizer.action_token_begin_idx
@@ -148,12 +166,13 @@ def build_dataloader(args, processor, vla, spec: ActionSpec):
         if "v01" not in args.teacher_path
         else VicunaV15ChatPromptBuilder,
     )
-    dataset = RLDSDataset(
+    dataset = DeterministicSingleRLDSDataset(
         args.data_root_dir,
         args.dataset_name,
         batch_transform,
         resize_resolution=tuple(vla.config.image_sizes),
-        shuffle_buffer_size=max(1, args.shuffle_buffer_size),
+        shuffle_buffer_size=args.shuffle_buffer_size,
+        train=True,
         image_aug=args.image_aug,
     )
     collator = PaddedCollatorForActionPrediction(
@@ -240,6 +259,10 @@ def run_export(args, spec: ActionSpec) -> None:
         "action_token_begin_idx": begin_idx,
         "image_aug": bool(args.image_aug),
         "shuffle_buffer_size": args.shuffle_buffer_size,
+        "data_order": DATA_ORDER,
+        "rlds_shard_shuffle": False,
+        "rlds_num_parallel_reads": 1,
+        "rlds_num_parallel_calls": 1,
         "dataset_length": dataset_length,
         "limit": args.limit,
         "target_samples": target,
@@ -276,6 +299,10 @@ def run_export(args, spec: ActionSpec) -> None:
             "action_token_begin_idx",
             "image_aug",
             "shuffle_buffer_size",
+            "data_order",
+            "rlds_shard_shuffle",
+            "rlds_num_parallel_reads",
+            "rlds_num_parallel_calls",
             "dataset_length",
             "limit",
             "target_samples",

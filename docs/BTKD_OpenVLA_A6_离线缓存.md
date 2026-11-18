@@ -205,13 +205,14 @@ bash run_a6_single_gpu.sh train  --dataset bridge_orig   # QLoRA 蒸馏
 │   ├── spec.py        # ActionSpec（词表/分箱/维度）、BTKDConfig（T/λ/b/α）
 │   ├── core.py        # 纯张量实现：easy-hard 划分、calibrate3、KL、权重、总损失
 │   ├── cache.py       # 分片 fp16 缓存：写入 / mmap 读取 / 统计 / 断点续写
+│   ├── rlds_dataset.py# 确定性单数据集 RLDS 管线（导出/训练共享的逐行顺序契约）
 │   └── vla_glue.py    # OpenVLA 模型加载、action logits 抽取（懒加载 prismatic）
 ├── scripts/
 │   ├── export_teacher_logits.py   # 第 1 步：导出 teacher 缓存（支持 --dummy 与 --resume）
 │   ├── train_btkd_student.py      # 第 3 步：LoRA/QLoRA student + BTKD loss
 │   └── smoke_test_a6.py           # CPU 全链路冒烟测试（不需要模型和数据）
 ├── tests/
-│   └── test_core.py               # 18 个单元测试（核心数学 + 缓存续写/回绕）
+│   └── test_core.py               # 19 个单元测试（核心数学 + 缓存续写/回绕）
 └── docs/
     └── BTKD_OpenVLA_A6_离线缓存.md  # 本文档
 ```
@@ -257,6 +258,8 @@ python scripts/export_teacher_logits.py \
 - 中断后加 `--resume` 从 manifest 实际落盘行继续，可以更换 `--batch_size`。
 - `progress.json` 只用于观察进度，**不是**续写依据。
 - `--shuffle_buffer_size` 必须为 1，且 **`--image_aug` 必须关闭**（默认关闭），原因见 §7。
+- 导出不再使用 OpenVLA 自带的 `RLDSDataset`，而是 `btkd_vla/rlds_dataset.py` 中的
+  `DeterministicSingleRLDSDataset`：TFDS 分片文件**不 shuffle**，读/映射/展平并行度全部固定为 1。
 
 导出结果：
 
@@ -362,7 +365,7 @@ python scripts/train_btkd_student.py \
 | `--logit_norm` | none | `none`/`center`/`std`。**teacher 和 student 同架构（LoRA）时保持 none**；若换成异构小模型，用 `std` |
 | `--renormalize_empty_branch` | 关 | 开：某分支为空时把权重让给另一个分支（偏离论文但更稳） |
 | `--verify_batches` | 5 | 前 N 个 batch 校验 GT token；每次 epoch 回绕也会强制校验 |
-| `--shuffle_buffer_size` | 1 | **导出与训练必须一致**，1 = 保持原始顺序 |
+| `--shuffle_buffer_size` | 1 | 必须为 1；确定性顺序由 `DeterministicSingleRLDSDataset` 保证，导出与训练必须使用同一数据集 |
 | `--limit` | -1 | 只用前 N 条（调试用）；会禁用缓存回绕 |
 | `--quantize_4bit` | 关 | QLoRA，省显存；训练侧 4-bit 是可接受的（只有 teacher 侧不能 4-bit） |
 | `--attn_implementation` | sdpa | 该环境未装 flash-attn，`sdpa` 是正确选择 |
@@ -374,11 +377,21 @@ python scripts/train_btkd_student.py \
 ### 7.1 数据顺序必须一致
 
 缓存是**按导出顺序**逐行追加的，训练时按同样顺序逐行读取，**不存 key**（存 key 需要每帧
-稳定的 traj/frame id，RLDS 重构后的 batch 里拿不到）。为了保证一致：
+稳定的 traj/frame id，RLDS 重构后的 batch 里拿不到）。跨进程复现顺序需要比
+"`shuffle_buffer_size=1`"更强的约束，因为 OpenVLA 自带的 `RLDSDataset` 还会：
 
-- 两个脚本都使用 `--shuffle_buffer_size 1`（等价于不 shuffle）
-- 两个脚本都关闭 `--image_aug`
-- 训练脚本默认用前 `--verify_batches` 个 batch 做**逐 token 比对**：
+- 随机化 TFDS 分片文件（shard）的读取顺序；
+- 让 TensorFlow AUTOTUNE 决定 `num_parallel_reads` / `num_parallel_calls`。
+
+这两点都会让导出进程和训练进程从不同样本开始，即使帧级 shuffle buffer 为 1。因此两个脚本
+统一改用 `btkd_vla.rlds_dataset.DeterministicSingleRLDSDataset`：
+
+- TFDS `shuffle=False`，分片文件按固定顺序读取；
+- `num_parallel_reads=1`、trajectory/frame transform 单线程、`flatten(num_parallel_calls=1)`；
+- 只支持单数据集（多数据集混合的随机采样流无法提供稳定的逐行契约）；
+- 仍然要求 `--shuffle_buffer_size 1` 且关闭 `--image_aug`。
+
+训练脚本默认用前 `--verify_batches` 个 batch 做**逐 token 比对**：
 
 ```
 cache/dataset misalignment at batch 3 (cache rows starting at 12).
@@ -386,7 +399,9 @@ cache/dataset misalignment at batch 3 (cache rows starting at 12).
   dataset: [[31876, 31999, ...]]
 ```
 
-一旦出现，说明两次运行的顺序不同 —— 重新导出一份即可。
+一旦出现，说明缓存来自旧版顺序或数据集内容已变化 —— 用当前代码重新导出即可。运行器
+`run_a6_single_gpu.sh export` 会自动把旧版本/旧顺序缓存备份成
+`caches/<name>.legacy_YYYYMMDD_HHMMSS` 后重导。
 
 > 副作用：训练是顺序遍历，没有 shuffle。对 KD 训练影响有限（teacher 信号本身就有正则性），
 > 但如果你要做严格的 shuffle，需要额外实现「按 key 索引」的缓存（用 traj id + frame idx 作 key），
@@ -430,8 +445,14 @@ easy/hard 判定会失真。默认关闭；如果你确实想用增强，请把�
 
 ### 9.1 `cache/dataset misalignment`
 
-顺序不一致。最常见原因：导出和训练用了不同的 `--shuffle_buffer_size`（或其中一次改了
-`--dataset_name` / 数据目录内容）。重新导出即可。
+缓存与数据集顺序不一致。可能原因：
+
+1. 缓存是**旧版代码**导出的（manifest 中没有 `data_order=deterministic_single_rlds_v1`）；
+2. 导出后 `--dataset_name` / 数据目录内容发生了变化；
+3. 导出或训练时改了 `--shuffle_buffer_size`，或打开了 `--image_aug`。
+
+处理：用当前代码重新导出。`run_a6_single_gpu.sh export` 会检测旧格式并自动备份重导；
+手动执行时加 `--overwrite`。
 
 ### 9.2 训练 loss 出现 NaN
 
