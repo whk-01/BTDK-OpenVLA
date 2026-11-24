@@ -321,6 +321,12 @@ python scripts/train_btkd_student.py --cache_dir caches/bridge_orig_teacher \
     --batch_size 1 --grad_accumulation_steps 16 --quantize_4bit \
     --shuffle_buffer_size 1
 
+# step 4: offline validation of a trained adapter against the cached teacher
+# (one 7B model; 512 rows by default, no simulator needed)
+bash run_a6_single_gpu.sh eval --dataset libero_spatial_no_noops \
+    --cache caches/libero_spatial_teacher \
+    --adapter runs_btkd/<exp>/final --gpu 3 --limit 512
+
 # CPU-only verification of the whole pipeline
 bash run_a6_smoke.sh
 ```
@@ -337,6 +343,10 @@ disables TFDS shard-file shuffling and pins all RLDS read/map/flatten parallelis
 on their own (upstream `RLDSDataset` still shuffles shards across processes). Caches whose
 manifest lacks `data_order=deterministic_single_rlds_v1` must be re-exported;
 `run_a6_single_gpu.sh export` backs them up to `*.legacy_<timestamp>` and re-exports automatically.
+
+The offline check reports `student_token_acc`, `teacher_token_acc` (the ceiling on this cache),
+`student_teacher_agreement`, and easy/hard branch accuracy. It is a fit/sanity check on the
+training cache; real task success still requires LIBERO rollouts.
 
 Full walkthrough (loss derivation, parameter table, failure modes, and the list of deliberate
 deviations from the paper): **[docs/BTKD_OpenVLA_A6_离线缓存.md](docs/BTKD_OpenVLA_A6_离线缓存.md)**.

@@ -5,6 +5,7 @@
 #   bash run_a6_single_gpu.sh export --dataset bridge_orig    # 1) 导出 teacher logits
 #   bash run_a6_single_gpu.sh check  --dataset bridge_orig    # 2) 只校验缓存
 #   bash run_a6_single_gpu.sh train  --dataset bridge_orig    # 3) QLoRA 蒸馏
+#   bash run_a6_single_gpu.sh eval   --dataset bridge_orig    # 4) 离线验证 adapter（对比缓存 teacher）
 #   bash run_a6_single_gpu.sh all    --dataset bridge_orig    # 1+2+3 顺序执行
 #
 #   默认只把一张卡暴露给进程：CUDA_VISIBLE_DEVICES=<GPU>，脚本内一律 --device cuda:0
@@ -39,8 +40,11 @@ CACHE=""
 BS=2
 SHARD=5000
 LIMIT=-1
+LIMIT_SET=0
 TRAIN_BS=4
 TRAIN_GA=4
+EVAL_BS=4
+ADAPTER=""
 MAX_STEPS=20000
 SAVE_STEPS=2000
 PY=""
@@ -67,9 +71,11 @@ usage() {
   --cache DIR             缓存目录（默认 <repo>/caches/<dataset>_teacher）
   --gpu 0|N|auto|all      使用哪张卡（默认 0）
   --batch-size N          导出 batch（默认 2；OOM 自动降 1）
-  --limit N               只导出前 N 条（调试用）
+  --limit N               export/train 只处理前 N 条（调试用）；eval 下 -1 = 全部
   --train-batch-size N    训练 batch（默认 4）
   --grad-accum N          梯度累积（默认 4）
+  --adapter DIR           eval 用的 LoRA adapter（默认自动取 runs_btkd/*/final 最新一个）
+  --eval-batch-size N     eval batch（默认 4；不传 --limit 时只验证前 512 条）
   --max-steps N           训练步数（默认 20000）
   --python PATH           指定 python（默认用 conda 环境里的）
   --env-name NAME         conda 环境名（默认 BTKD / $BTKD_ENV_NAME）
@@ -86,8 +92,10 @@ while [[ $# -gt 0 ]]; do
         --cache)            CACHE="$2"; shift 2 ;;
         --gpu)              GPU="$2"; shift 2 ;;
         --batch-size)       BS="$2"; shift 2 ;;
-        --limit)            LIMIT="$2"; shift 2 ;;
+        --limit)            LIMIT="$2"; LIMIT_SET=1; shift 2 ;;
         --train-batch-size) TRAIN_BS="$2"; shift 2 ;;
+        --adapter)          ADAPTER="$2"; shift 2 ;;
+        --eval-batch-size)  EVAL_BS="$2"; shift 2 ;;
         --grad-accum)       TRAIN_GA="$2"; shift 2 ;;
         --max-steps)        MAX_STEPS="$2"; shift 2 ;;
         --python)           PY="$2"; shift 2 ;;
@@ -102,7 +110,7 @@ done
 [[ "${CACHE}" == "" ]] && CACHE="${SCRIPT_DIR}/caches/${DATASET}_teacher"
 
 if [[ "${MODE}" == "help" ]]; then usage; exit 0; fi
-case "${MODE}" in export|check|train|all) ;; *) die "第一个参数必须是 export|check|train|all，收到: ${MODE}" ;; esac
+case "${MODE}" in export|check|train|eval|all) ;; *) die "第一个参数必须是 export|check|train|eval|all，收到: ${MODE}" ;; esac
 
 exec > >(tee -a "${LOG_FILE}") 2>&1
 trap 'die "脚本在第 $LINENO 行失败；日志: ${LOG_FILE}"' ERR
@@ -322,10 +330,37 @@ do_train() {
     if [[ "${DRY_RUN}" == "0" ]]; then ok "训练完成，检查 runs_btkd/ 下的 checkpoint"; fi
 }
 
+do_eval() {
+    step "4. 离线验证 adapter（不加载 teacher，不跑仿真）"
+    local eval_limit=512
+    if [[ "${LIMIT_SET}" == "1" ]]; then
+        eval_limit="${LIMIT}"
+    else
+        warn "未指定 --limit：eval 默认只验证前 512 条（全量会非常慢，可用 --limit -1 显式开启）"
+    fi
+    if [[ -z "${ADAPTER}" ]]; then
+        ADAPTER="$(ls -td "${SCRIPT_DIR}"/runs_btkd/*/final 2>/dev/null | head -1 || true)"
+        [[ -n "${ADAPTER}" ]] || die "找不到 adapter：请用 --adapter 指定 runs_btkd/<exp>/final 或 checkpoint-XXXX"
+        warn "未指定 --adapter，自动使用最新的: ${ADAPTER}"
+    fi
+    local -a cmd=("${PY}" scripts/eval_btkd_student.py
+        --cache_dir "${CACHE}"
+        --dataset_name "${DATASET}"
+        --data_root_dir "${DATA_ROOT}"
+        --vla_path "${TEACHER}"
+        --adapter_path "${ADAPTER}"
+        --batch_size "${EVAL_BS}"
+        --limit "${eval_limit}"
+        --device cuda:0)
+    exec_cmd "${cmd[@]}"
+    if [[ "${DRY_RUN}" == "0" ]]; then ok "验证完成"; fi
+}
+
 case "${MODE}" in
     export) do_export ;;
     check)  do_check ;;
     train)  do_train ;;
+    eval)   do_eval ;;
     all)    do_export; do_check; do_train ;;
 esac
 

@@ -210,6 +210,7 @@ bash run_a6_single_gpu.sh train  --dataset bridge_orig   # QLoRA 蒸馏
 ├── scripts/
 │   ├── export_teacher_logits.py   # 第 1 步：导出 teacher 缓存（支持 --dummy 与 --resume）
 │   ├── train_btkd_student.py      # 第 3 步：LoRA/QLoRA student + BTKD loss
+│   ├── eval_btkd_student.py       # 第 4 步：离线验证 adapter（对比缓存 teacher）
 │   └── smoke_test_a6.py           # CPU 全链路冒烟测试（不需要模型和数据）
 ├── tests/
 │   └── test_core.py               # 19 个单元测试（核心数学 + 缓存续写/回绕）
@@ -232,7 +233,7 @@ conda activate BTKD
 cd /home/whk/BTKD
 ```
 
-`btkd_vla` 不需要 `pip install`：三个脚本都会把仓库根目录插入 `sys.path`。
+`btkd_vla` 不需要 `pip install`：`scripts/` 下的脚本都会把仓库根目录插入 `sys.path`。
 
 ### Step 1：导出 teacher logits（大显存机器）
 
@@ -351,6 +352,42 @@ python scripts/train_btkd_student.py \
 
 产物：`runs_btkd/<exp>/final/`（PEFT adapter），可参考 `openvla/README.md` 的
 "merge LoRA" 流程合并回完整权重再部署。
+
+### Step 4：离线验证 adapter（推荐）
+
+只加载学生一个模型，用同一份缓存对比 student / teacher：
+
+```bash
+bash run_a6_single_gpu.sh eval \
+  --dataset libero_spatial_no_noops \
+  --cache caches/libero_spatial_teacher \
+  --adapter runs_btkd/btkd+openvla-7b+libero_spatial_no_noops+b16+lr0.0005+T4.0+lam0.5/final \
+  --gpu 3 --env-name whk_BTKD \
+  --limit 512
+```
+
+不传 `--adapter` 时 runner 会自动取最新的 `runs_btkd/*/final`；不传 `--limit` 时默认只
+验证前 512 条（全量很慢）。想看 base 基线就直接调用脚本且不传 `--adapter_path`：
+
+```bash
+python scripts/eval_btkd_student.py \
+  --cache_dir caches/libero_spatial_teacher \
+  --dataset_name libero_spatial_no_noops --limit 512
+```
+
+先测 base、再测 adapter，对比提升。
+
+核心指标：
+
+| 指标 | 含义 |
+|---|---|
+| `student_token_acc` | 学生动作 token 命中 GT 的比例 |
+| `teacher_token_acc` | 缓存 teacher 命中 GT 的比例（离线上限） |
+| `student_teacher_agreement` | 学生 argmax 与 teacher argmax 的一致率 |
+| `student_token_acc_easy/hard` | 按 teacher 是否正确划分的两个分支各自的命中率 |
+
+注意：验证样本就是训练缓存本身，所以这是"是否学会"的拟合检查，不是泛化指标。
+真正的成功率要用 LIBERO 仿真 rollout 评估。
 
 ---
 
