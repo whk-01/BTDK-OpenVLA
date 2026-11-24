@@ -556,7 +556,9 @@ python scripts/eval_btkd_student.py \
 - TFDS `shuffle=False`，分片文件按固定顺序读取；
 - `num_parallel_reads=1`、trajectory/frame transform 单线程、`flatten(num_parallel_calls=1)`；
 - 只支持单数据集（多数据集混合的随机采样流无法提供稳定的逐行契约）；
-- 仍然要求 `--shuffle_buffer_size 1` 且关闭 `--image_aug`。
+- `--shuffle_buffer_size 1` 且 `--image_aug` 关闭这一条，对**导出/物化**依然强制；
+  训练读 frames 时已经不再触碰 RLDS，所以训练侧的 shuffle 由 `torch.randperm` 完成
+  （`--no_shuffle_frames` 可关掉）。
 
 训练脚本默认用前 `--verify_batches` 个 batch 做**逐 token 比对**：
 
@@ -714,4 +716,5 @@ python scripts/train_btkd_student.py --cache_dir /tmp/btkd_dummy_a6 --dataset_na
 2. **feature-level KD**：缓存 teacher 的中间层特征（体积会大很多，需要 fp16 + 降维）。
 3. **方案 B（共享骨干双 adapter）**：一份 7B + 两个 LoRA，前向只算一次骨干；
    24 GB 可行，但仍受「初始 KD=0」的限制，需要 warmup。
-4. **缓存 key 化**：给 RLDS 每帧生成 `traj_id/frame_idx` 作为 key，就可以支持 shuffle 训练。
+4. **缓存 key 化**：给 RLDS 每帧生成 `traj_id/frame_idx` 作为 key，可以让缓存脱离「同一份
+   数据集必须还在本地」的约束（frames 已经解决了 shuffle，但没有解决数据搬移）。
