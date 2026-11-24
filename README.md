@@ -300,9 +300,11 @@ models need ~38-45 GB, so instead the teacher runs once, its 7x256 action-token 
 conda activate BTKD && cd /home/whk/BTKD
 
 # optional run-only helper: pins one visible GPU and picks batch sizes (not part of env install)
-bash run_a6_single_gpu.sh export --dataset bridge_orig   # bs=2, auto-falls back to 1 on OOM
-bash run_a6_single_gpu.sh check  --dataset bridge_orig
-bash run_a6_single_gpu.sh train  --dataset bridge_orig   # QLoRA bs=4 x accum 4
+bash run_a6_single_gpu.sh export      --dataset bridge_orig   # bs=2, auto-falls back to 1 on OOM
+bash run_a6_single_gpu.sh check       --dataset bridge_orig
+bash run_a6_single_gpu.sh materialize --dataset bridge_orig   # CPU, once: writes frames/*.pt
+bash run_a6_single_gpu.sh train       --dataset bridge_orig   # 2 epochs, eval every 2000 updates
+bash run_a6_single_gpu.sh eval        --dataset bridge_orig   # offline check of best/
 
 # step 1: export teacher logits once, in deterministic dataset order
 # (uses btkd_vla/rlds_dataset.py: TFDS shard shuffle off, single read/map worker)
@@ -315,21 +317,39 @@ python scripts/export_teacher_logits.py --teacher_path openvla/openvla-7b \
 python scripts/train_btkd_student.py --cache_dir caches/bridge_orig_teacher \
     --dataset_name bridge_orig --check_cache_only
 
-# step 3: train the student (image augmentation and shuffling stay off)
+# step 2.5: materialise the frames once (CPU only, ~300 KB/sample -> ~16 GB for 53k rows).
+# After this, row i of frames == row i of the cache, so training no longer decodes
+# TFRecord/JPEG on the critical path and can shuffle + run multiple epochs safely.
+python scripts/materialize_frames.py --cache_dir caches/bridge_orig_teacher \
+    --dataset_name bridge_orig --data_root_dir /data/open-x-embodiment \
+    --vla_path openvla/openvla-7b --shard_size 1000 --skip_if_complete
+
+# step 3: train the student, counted in epochs (not micro-batches)
 python scripts/train_btkd_student.py --cache_dir caches/bridge_orig_teacher \
     --data_root_dir /data/open-x-embodiment --dataset_name bridge_orig \
     --batch_size 1 --grad_accumulation_steps 16 --quantize_4bit \
-    --shuffle_buffer_size 1
+    --gradient_checkpointing --epochs 2 \
+    --temperature 2.0 --easy_hold_frac 0.4 \
+    --lr_schedule cosine --lr_warmup_frac 0.03 \
+    --save_steps 2000 --eval_steps 2000 --eval_limit 512
 
 # step 4: offline validation of a trained adapter against the cached teacher
 # (one 7B model; 512 rows by default, no simulator needed)
 bash run_a6_single_gpu.sh eval --dataset libero_spatial_no_noops \
     --cache caches/libero_spatial_teacher \
-    --adapter runs_btkd/<exp>/final --gpu 3 --limit 512
+    --adapter runs_btkd/<exp>/best --gpu 3 --limit 512
 
 # CPU-only verification of the whole pipeline
 bash run_a6_smoke.sh
 ```
+
+Training defaults (2026-11): step counts are **optimizer updates**, not micro-batches, and
+`--epochs 2` is the recommended budget (the previous `--max_steps 20000` was 20000/accum=16 =
+~1250 updates = 0.38 epoch, which is why `final` underperformed `checkpoint-8000`).
+`--easy_hold_frac 0.4` keeps `b=1` for the first 40% of the run so the student actually learns the
+teacher before the schedule moves into the `calibrate3` hard branch; `--lr_warmup_frac 0.03`
+adds a linear warmup. In-training eval every `--eval_steps` updates writes the best adapter to
+`best/` — prefer `best/` over `final/`.
 
 Export semantics: without `--limit`, exactly one dataset pass is cached. If an export is
 interrupted, `--resume` continues from the rows recorded in `manifest.json` (not from the

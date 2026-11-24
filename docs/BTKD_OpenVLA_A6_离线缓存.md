@@ -176,10 +176,14 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 仓库里的 `run_a6_single_gpu.sh` 已经把上面这些、批量大小、OOM 自动降档都封好了：
 
 ```bash
-bash run_a6_single_gpu.sh export --dataset bridge_orig   # 导出（内部 --device cuda:0）
-bash run_a6_single_gpu.sh check  --dataset bridge_orig   # 校验缓存
-bash run_a6_single_gpu.sh train  --dataset bridge_orig   # QLoRA 蒸馏
+bash run_a6_single_gpu.sh export      --dataset bridge_orig   # 1) 导出（内部 --device cuda:0）
+bash run_a6_single_gpu.sh check       --dataset bridge_orig   # 2) 校验缓存
+bash run_a6_single_gpu.sh materialize --dataset bridge_orig   # 3) 物化帧（CPU，一次性）
+bash run_a6_single_gpu.sh train       --dataset bridge_orig   # 4) 蒸馏（自动用 frames 快路径）
+bash run_a6_single_gpu.sh eval        --dataset bridge_orig   # 5) 离线验证 best/
 ```
+
+`train` 发现没有 frames 会自动先跑 `materialize`，所以实际上 `export → check → train` 也能走通。
 
 `--gpu 3` 指定别的卡，`--gpu auto` 挑当前最空闲的一张。
 
@@ -204,16 +208,19 @@ bash run_a6_single_gpu.sh train  --dataset bridge_orig   # QLoRA 蒸馏
 ├── btkd_vla/
 │   ├── spec.py        # ActionSpec（词表/分箱/维度）、BTKDConfig（T/λ/b/α）
 │   ├── core.py        # 纯张量实现：easy-hard 划分、calibrate3、KL、权重、总损失
-│   ├── cache.py       # 分片 fp16 缓存：写入 / mmap 读取 / 统计 / 断点续写
+│   ├── cache.py       # 分片 fp16 缓存：写入 / mmap 读取 / 随机 gather / 断点续写
+│   ├── frames.py      # 帧存储：input_ids/labels/pixel_values(fp16) 分片 + LRU mmap
+│   ├── evaluate.py    # 共用离线指标（MetricAccumulator / offline_eval_frames）
 │   ├── rlds_dataset.py# 确定性单数据集 RLDS 管线（导出/训练共享的逐行顺序契约）
 │   └── vla_glue.py    # OpenVLA 模型加载、action logits 抽取（懒加载 prismatic）
 ├── scripts/
 │   ├── export_teacher_logits.py   # 第 1 步：导出 teacher 缓存（支持 --dummy 与 --resume）
+│   ├── materialize_frames.py      # 第 2.5 步：把帧物化到磁盘（训练不再解 TFDS/JPEG）
 │   ├── train_btkd_student.py      # 第 3 步：LoRA/QLoRA student + BTKD loss
 │   ├── eval_btkd_student.py       # 第 4 步：离线验证 adapter（对比缓存 teacher）
 │   └── smoke_test_a6.py           # CPU 全链路冒烟测试（不需要模型和数据）
 ├── tests/
-│   └── test_core.py               # 19 个单元测试（核心数学 + 缓存续写/回绕）
+│   └── test_core.py               # 24 个单元测试（数学 + 缓存 + frames + 调度 + 指标）
 └── docs/
     └── BTKD_OpenVLA_A6_离线缓存.md  # 本文档
 ```
@@ -305,53 +312,167 @@ python scripts/train_btkd_student.py \
 | `out_of_space_frac` | ≈ 0 | 偏高 → teacher 未在该数据集上微调，argmax 溢出到语言 token |
 | `nonfinite_logits` | 0 | > 0 → 导出时有 NaN（bf16 溢出或 4-bit 量化异常） |
 
-### Step 3：训练 student
+### Step 2.5：物化训练帧（新；一次 20–40 分钟，之后训练快 5–10 倍）
 
-24 GB（bf16 LoRA，batch 1）：
+A6 为了「缓存和数据集逐行对齐」，把 RLDS 管线固定成单读线程 + 单 map 线程。对齐是对的，
+但它把 **JPEG 解码放到了每个训练 step 的关键路径上**：一张 3090 Ti 上 batch=1 只有个位数
+step/s，瓶颈完全不在 GPU（`nvidia-smi` 里利用率常年 0–20%），而在 CPU。
+
+解决方式：**把模型真正要吃的东西按 cache 行号物化一次**。
+
+```
+RLDS（确定性顺序，只遍历一次）
+   └──> frames/shard_XXXXX.pt
+          input_ids      int32 [D]
+          labels         int32 [D]
+          pixel_values   fp16  [3,224,224]
+```
+
+之后训练只做「按行号读 frames[i] + 读 cache[i]」——两者行号天然相同，对齐由构造保证，
+不再需要每个 step 校验，也**第一次可以安全地 shuffle 和跑多 epoch**。
+
+```bash
+python scripts/materialize_frames.py \
+    --cache_dir    caches/libero_spatial_teacher \
+    --out_dir      caches/libero_spatial_teacher_frames \
+    --dataset_name libero_spatial_no_noops \
+    --data_root_dir datasets/open-x-embodiment \
+    --vla_path     ./openvla/openvla-7b \
+    --shard_size   1000 \
+    --skip_if_complete
+```
+
+或者直接用运行器（`train` 发现没有 frames 时会自动先做这一步）：
+
+```bash
+bash run_a6_single_gpu.sh materialize \
+  --dataset libero_spatial_no_noops \
+  --cache caches/libero_spatial_teacher \
+  --gpu 3 --env-name whk_BTKD
+```
+
+要点：
+
+- **纯 CPU**，只加载 tokenizer + image processor，不加载 7B 权重；可以和其他 GPU 任务并行。
+- 每个样本都会把 `labels` 与 cache 的 GT token 逐 token 比对，错位立刻报错（`--verify_every 1`）。
+- 磁盘：`3×224×224×2B ≈ 300 KB/样本`，LIBERO spatial 5.3 万条约 **16 GB**；先确认 `df -h`。
+- `--skip_if_complete`：已完整就跳过；要重建用 `--overwrite`（运行器里是 `--overwrite-frames`）。
+- 中断不会留下"假完整"的 manifest：只有正常关闭才会写 `complete=true`，重跑会自动重建。
+- 不物化也能训练（`--no-materialize`），只是回到慢路径，仅建议调试用。
+
+### Step 3：训练 student（按 epoch 计步）
+
+> **重要变更（2026-11）**：`--max_steps` 以前是 **micro-batch 数**，`bs=1 × accum=16` 时
+> 20000 步其实只有 **1250 次 optimizer update ≈ 0.38 个 epoch**。这是上一轮
+> `final` 反而不如 `checkpoint-8000` 的主因之一。现在默认改成 `--epochs 2`。
+
+单卡 24 GB 推荐（运行器一条命令，自动物化 + bf16 LoRA + 训练中评估）：
+
+```bash
+bash run_a6_single_gpu.sh train \
+  --dataset libero_spatial_no_noops \
+  --cache caches/libero_spatial_teacher \
+  --teacher ./openvla/openvla-7b \
+  --gpu 3 --env-name whk_BTKD \
+  --epochs 2
+```
+
+它实际展开成：
+
+```bash
+python scripts/train_btkd_student.py \
+    --cache_dir     caches/libero_spatial_teacher \
+    --frames_dir    caches/libero_spatial_teacher_frames \
+    --dataset_name  libero_spatial_no_noops \
+    --vla_path      ./openvla/openvla-7b \
+    --batch_size 1 --grad_accumulation_steps 16 \
+    --gradient_checkpointing \
+    --epochs 2 \
+    --learning_rate 5e-4 --lr_schedule cosine --lr_warmup_frac 0.03 \
+    --temperature 2.0 --lambda_stu 0.5 --easy_hold_frac 0.4 \
+    --save_steps 2000 --eval_steps 2000 --eval_limit 512 \
+    --run_root_dir runs_btkd
+```
+
+`--save_steps` / `--eval_steps` 现在都按 **optimizer update** 计（不是 micro-batch）。
+`checkpoint-<N>` 里的 N 也是 update 序号。
+
+手动跑（QLoRA 版，装得上 `bitsandbytes` 时）：
 
 ```bash
 python scripts/train_btkd_student.py \
     --cache_dir    caches/bridge_orig_teacher \
     --vla_path     openvla/openvla-7b \
-    --data_root_dir /data/open-x-embodiment \
     --dataset_name  bridge_orig \
     --batch_size 1 --grad_accumulation_steps 16 \
-    --max_steps 20000 --learning_rate 5e-4 \
-    --lora_rank 32 \
-    --temperature 4.0 --lambda_stu 0.5 \
-    --shuffle_buffer_size 1 \
+    --quantize_4bit --gradient_checkpointing \
+    --epochs 2 --learning_rate 5e-4 \
+    --temperature 2.0 --easy_hold_frac 0.4 \
+    --eval_steps 2000 --eval_limit 512 \
     --run_root_dir runs_btkd
 ```
 
-8–12 GB（QLoRA）：
+#### 3.1 为什么 `checkpoint-8000` 会好于 `final`
 
-```bash
-python scripts/train_btkd_student.py \
-    --cache_dir    caches/bridge_orig_teacher \
-    --vla_path     openvla/openvla-7b \
-    --data_root_dir /data/open-x-embodiment \
-    --dataset_name  bridge_orig \
-    --batch_size 1 --grad_accumulation_steps 16 \
-    --max_steps 20000 --learning_rate 5e-4 \
-    --lora_rank 32 --quantize_4bit \
-    --shuffle_buffer_size 1 \
-    --run_root_dir runs_btkd
+上一轮（`T=4.0`、`max_steps=20000` micro-batch、无 warmup、无 easy hold）的现象是：
+
+| 版本 | student_token_acc |
+|---|---:|
+| base（未蒸馏） | 0.113 |
+| checkpoint-8000 | 0.364 |
+| final（20000） | 0.353 |
+
+三个叠加原因：
+
+1. **训练量根本不够**：20000 micro-batch / accum 16 = 1250 次更新 ≈ 0.38 epoch。
+   前 8000 步（500 次更新）还处在"快速上升期"，最后 12000 步（750 次更新）只是在
+   同一批 38% 的数据上过拟合，然后被调度推进 hard 分支。
+2. **调度从第 0 步就开始退火**：`b = cos²(π/2·t/T)` 在 t=0 就是 1，之后单调下降。
+   而后 60% 的 hard 分支拟合的是 `calibrate3(teacher)`——**故意偏离 GT 的分布**。
+   学生还没学会 teacher，就被拉去学"比 teacher 更偏"的目标，GT 命中率自然回落。
+3. **学习率没有 warmup**：LoRA 一开始就是 5e-4，前几百步容易把预训练能力冲掉一部分。
+
+对应的三个修改（现在的默认值）：
+
+| 现象 | 修改 | 参数 |
+|---|---|---|
+| 只跑了 0.38 epoch | 按 epoch 计步 | `--epochs 2`（≈ 6600 次更新） |
+| 尾部被 hard 分支拖回去 | 前 40% 保持 easy 分支，之后才退火 | `--easy_hold_frac 0.4` |
+| 开头不稳 | 3% warmup + cosine | `--lr_schedule cosine --lr_warmup_frac 0.03` |
+
+另外新增：每 2000 次更新做一次离线评估，指标最好的权重存到 `best/`。
+**最终请用 `best/`，不要默认用 `final/`** ——`final` 是最后一刻的权重，最后一个 eval 点之后
+仍可能继续回退。
+
+#### 3.2 训练日志与产物
+
+```
+[plan] samples=52970 steps/epoch=52970 batch=1 accum=16 -> micro_batches=105940
+       optimizer_updates=6622 (2.00 epochs), lr=0.0005 warmup=0.03 easy_hold=0.4 T=2.0
+[step  15680 upd   980] loss=... ce=... kd=... b=0.412 easy_frac=0.907 lr=... ep=0.30 eta=...
+[eval @ update 2000 (step 31999)] student=0.41 dim0-5=0.28 teacher=0.9157 agreement=0.44 (312s, 512 rows)
+[eval] new best -> runs_btkd/<exp>/best (update 2000, step 31999, acc 0.4100)
+[save] runs_btkd/<exp>/checkpoint-4000 (update 4000, step 63999)
 ```
 
-日志每 `--log_steps` 打印：
+产物：
 
 ```
-[step   100] loss=0.4123 ce=0.3810 kd=0.0626 easy=0.0310 hard=0.0316 b=0.994 teacher_tok_acc=0.912 easy_frac=0.905
+runs_btkd/<exp>/
+├── train_config.json    # 解析后的总步数/epoch/exp 名，出问题先看它
+├── metrics.jsonl        # 每 log_steps 一行 train 记录 + 每次 eval 一行
+├── best/               # 训练中评估最好的 adapter  ← 优先用这个
+├── checkpoint-2000/    # 每 --save_steps 个 update 一份
+├── checkpoint-4000/
+└── final/              # 最后一刻的权重
 ```
 
 需要重点盯的三件事：
 
 1. `ce` 要持续下降（这是学生真正的任务项）
-2. `b` 按 `cos²` 从 1 掉到 0，`easy`/`hard` 两列在 `b≈0.5` 之后应该由 `hard` 主导
-3. `teacher_tok_acc` 应稳定在导出时的水平；如果逐 step 抖动极大，说明缓存与数据错位（见 §7.1）
-
-产物：`runs_btkd/<exp>/final/`（PEFT adapter），可参考 `openvla/README.md` 的
-"merge LoRA" 流程合并回完整权重再部署。
+2. `b` 先保持 1.0 到 40%，然后按 `cos²` 掉到 0
+3. `student`（eval 行）应该单调上升；如果某次评估后一路下滑，说明 hard 分支在起反作用，
+   把 `--easy-hold-frac` 调到 0.6 或 `--temperature` 调到 4.0 再试
 
 ### Step 4：离线验证 adapter（推荐）
 
@@ -361,13 +482,13 @@ python scripts/train_btkd_student.py \
 bash run_a6_single_gpu.sh eval \
   --dataset libero_spatial_no_noops \
   --cache caches/libero_spatial_teacher \
-  --adapter runs_btkd/btkd+openvla-7b+libero_spatial_no_noops+b16+lr0.0005+T4.0+lam0.5/final \
+  --adapter runs_btkd/btkd+openvla-7b+libero_spatial_no_noops+b16+lr0.0005+T2.0+lam0.5+ep2+hold0.4/best \
   --gpu 3 --env-name whk_BTKD \
   --limit 512
 ```
 
-不传 `--adapter` 时 runner 会自动取最新的 `runs_btkd/*/final`；不传 `--limit` 时默认只
-验证前 512 条（全量很慢）。想看 base 基线就直接调用脚本且不传 `--adapter_path`：
+不传 `--adapter` 时 runner 会自动取最新的 `runs_btkd/*/final`（**建议手动传 `best/`**）；
+不传 `--limit` 时默认只验证前 512 条（全量很慢）。想看 base 基线就直接调用脚本且不传 `--adapter_path`：
 
 ```bash
 python scripts/eval_btkd_student.py \
@@ -395,7 +516,16 @@ python scripts/eval_btkd_student.py \
 
 | 参数 | 默认 | 说明 / 建议 |
 |---|---|---|
-| `--temperature` | 4.0 | KD 温度。**OpenVLA 的 logits 尺度与 ResNet 不同**，如果发现 `kd` 比 `ce` 小两个数量级，先试 2.0；反之试 6.0 |
+| `--epochs` | 0（脚本用 2） | **推荐按 epoch 计步**：2 个 epoch ≈ 6600 次 update。`--epochs 0` 才用 `--max_steps` |
+| `--max_steps` | 20000 | micro-batch 数（**不是** update 数）。只在 `--epochs 0` 时生效 |
+| `--easy_hold_frac` | 0.40 | 前 40% 保持 `b=1`（纯 easy 分支），之后才按 `cos²` 退火到 hard；0 = 论文原始调度 |
+| `--lr_schedule` | cosine | cosine / constant |
+| `--lr_warmup_frac` | 0.03 | 前 3% 线性 warmup，避免一上来就 5e-4 冲掉预训练 |
+| `--save_steps` | 2000 | 每 N 次 **optimizer update** 存 `checkpoint-N` |
+| `--eval_steps` | 0（脚本传 2000） | 每 N 次 update 做一次离线评估，最好的存 `best/`；0 = 关闭 |
+| `--eval_limit` | 512 | 训练中评估的样本数（越大越准越慢） |
+| `--gradient_checkpointing` | 关（脚本默认开） | 用算力换显存，24 GB 上必须开 |
+| `--temperature` | 2.0（脚本）/ 4.0（论文） | KD 温度。**OpenVLA 的 logits 尺度与 ResNet 不同**，如果发现 `kd` 比 `ce` 小两个数量级，先试 2.0；反之试 6.0 |
 | `--lambda_stu` | 0.5 | CE 权重，BTKD 论文默认 0.5。学生基础能力弱时调高（0.7） |
 | `--calibrate_strength` | 1.0 | 校准强度 α，1.0 = 论文原版，0.0 = 关闭校准（退化为普通 KD） |
 | `--schedule` | cos2 | 1→0 的余弦平方调度 |
@@ -440,9 +570,10 @@ cache/dataset misalignment at batch 3 (cache rows starting at 12).
 `run_a6_single_gpu.sh export` 会自动把旧版本/旧顺序缓存备份成
 `caches/<name>.legacy_YYYYMMDD_HHMMSS` 后重导。
 
-> 副作用：训练是顺序遍历，没有 shuffle。对 KD 训练影响有限（teacher 信号本身就有正则性），
-> 但如果你要做严格的 shuffle，需要额外实现「按 key 索引」的缓存（用 traj id + frame idx 作 key），
-> 这需要改 RLDS 数据管线，不在本次范围内。
+> 副作用（仅限**没物化 frames** 的老路径）：训练是顺序遍历，没有 shuffle。
+> **物化 frames 之后这个限制消失了**：`frames[i]` 和 `cache[i]` 是同一个样本，训练按随机
+> 行号同时 gather 两者（`LogitCache.get_rows`），所以默认开启 shuffle、可以跑任意 epoch。
+> 这也是必须物化的另一个理由——不只是快，还让多 epoch 训练不会按固定顺序重复。
 
 ### 7.2 图像增强必须关闭
 
@@ -522,7 +653,7 @@ easy/hard 判定会失真。默认关闭；如果你确实想用增强，请把�
 ```bash
 conda activate BTKD && cd /home/whk/BTKD
 
-python tests/test_core.py          # 18/18 passed
+python tests/test_core.py          # 24/24 passed
 python scripts/smoke_test_a6.py    # SMOKE TEST PASSED
 ```
 
@@ -547,6 +678,13 @@ python scripts/smoke_test_a6.py    # SMOKE TEST PASSED
 | `cache_resume_from_empty_manifest` | 0 行 manifest 可以从 row 0 续写 |
 | `cache_window_crosses_epoch_boundary` | batch 跨 epoch 时按 `[tail, head]` 读取且保持对齐 |
 | `cache_wrap_safety` | 只有完整缓存且训练未设 `--limit` 时才允许回绕 |
+| `cache_get_rows` | 乱序 / 重复 / 跨 shard 的随机 gather 与顺序读取逐值一致 |
+| `frame_store_roundtrip` | frames 写入/读取、fp16 像素、shard 边界 |
+| `frames_cache_same_index` | `frames_batches` 的 index 同时用于 frames 和 cache，仍逐行对齐 |
+| `frames_shuffle_tail_batch` | shuffle 后尾 batch 不丢样本，覆盖全量 n 条 |
+| `easy_hold_schedule` | `hold_frac=0.4` 前 40% 恒为 1，之后 `cos²` 到 0；`hold=0` 等价原调度 |
+| `metric_accumulator` | 训练中/独立评估共用指标口径（acc / agreement / easy-hard 分解） |
+| `resolve_plan_epochs` | `--epochs` → micro-batch/update 换算；尾 batch 不丢；复现旧 `--max_steps 20000` = 1250 次更新 |
 
 `scripts/smoke_test_a6.py` 跑的是完整链路：**写缓存 → 读缓存 → 300 步优化 toy student**，
 KD loss 从 `0.1231` 降到 `0.0008`，并验证了空分支行为：

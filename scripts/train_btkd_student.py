@@ -1,37 +1,53 @@
 #!/usr/bin/env python
-"""A6 step 3/3 -- train the OpenVLA student with BTKD using a cached teacher.
+"""A6 step 3/4 -- train the OpenVLA student with BTKD using a cached teacher.
 
-Only ONE model is resident here: the student (LoRA on ``openvla-7b`` by default).
-The teacher distribution comes from the on-disk cache produced by
-``scripts/export_teacher_logits.py``, so this fits comfortably in 24 GB (and in
-~10 GB with ``--quantize_4bit``).
+Only ONE model is resident here: the student (LoRA on ``openvla-7b``).  The
+teacher distribution comes from the on-disk cache written by
+``scripts/export_teacher_logits.py``, so a single 24 GB card is enough.
 
-Loss (faithful to ``dis_resnet18_cf100.py``)::
+Loss (BTKD, with an optional easy plateau)::
 
     loss = lambda * CE + (1 - lambda) * [ b * KL(stu || tea) + (1-b) * KL(stu || calibrate3(tea)) ]
-    b    = cos^2(pi/2 * step / total_steps)          # 1 (easy) -> 0 (hard)
+    b    = 1                                        if t < hold
+         = cos^2(pi/2 * (t-hold)/(1-hold))          otherwise
     T^2 is folded into the KL term.
+
+Data path
+---------
+* Preferred: a *materialised* frame store next to the cache
+  (``caches/<name>_teacher_frames``, built by ``scripts/materialize_frames.py``).
+  Row ``i`` of the frames == row ``i`` of the cache, so shuffling and multiple
+  epochs are safe and there is no TFDS/JPEG decode on the training path.
+* Fallback: the deterministic RLDS stream (requires ``--shuffle_buffer_size 1``),
+  which replays the exact order the cache was exported in.
+
+Steps
+-----
+``--epochs N`` is the recommended way to size a run: it converts to
+``ceil(N * n_samples / batch_size)`` micro-batches.  ``--max_steps`` keeps the
+old meaning (micro-batches) and is only used when ``--epochs 0``.
 
 Example
 -------
     python scripts/train_btkd_student.py \
-        --cache_dir caches/bridge_orig_teacher \
-        --vla_path openvla/openvla-7b \
-        --data_root_dir /data/open-x-embodiment --dataset_name bridge_orig \
-        --batch_size 4 --grad_accumulation_steps 4 --max_steps 20000 \
-        --lora_rank 32 --learning_rate 5e-4 \
-        --temperature 4.0 --lambda_stu 0.5
+        --cache_dir caches/libero_spatial_teacher \
+        --dataset_name libero_spatial_no_noops \
+        --epochs 2 --batch_size 2 --grad_accumulation_steps 8 \
+        --gradient_checkpointing --learning_rate 3e-4 \
+        --easy_hold_frac 0.4 --temperature 2.0 \
+        --eval_steps 1000 --eval_limit 512
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -40,10 +56,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from btkd_vla.cache import DATA_ORDER, LogitCache, cache_covers_full_epoch  # noqa: E402
 from btkd_vla.core import (  # noqa: E402
     btkd_term,
-    cosine_square_schedule,
+    cosine_square_schedule_hold,
     teacher_token_accuracy,
     total_loss,
 )
+from btkd_vla.frames import MANIFEST as FRAMES_MANIFEST  # noqa: E402
+from btkd_vla.frames import FrameStore  # noqa: E402
 from btkd_vla.spec import BTKDConfig  # noqa: E402
 from btkd_vla.vla_glue import extract_action_logits, move_pixel_values  # noqa: E402
 
@@ -61,30 +79,44 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--grad_accumulation_steps", type=int, default=4)
     p.add_argument("--learning_rate", type=float, default=5e-4)
-    p.add_argument("--max_steps", type=int, default=20_000)
-    p.add_argument("--save_steps", type=int, default=2_000)
+    p.add_argument("--epochs", type=float, default=0.0, help="number of dataset epochs (0 = use --max_steps)")
+    p.add_argument("--max_steps", type=int, default=20_000, help="micro-batches; only used when --epochs 0")
+    p.add_argument("--save_steps", type=int, default=2_000, help="optimizer updates between checkpoints")
     p.add_argument("--log_steps", type=int, default=20)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--lr_schedule", default="cosine", choices=["cosine", "constant"])
+    p.add_argument("--lr_warmup_frac", type=float, default=0.03)
 
     # LoRA / memory
     p.add_argument("--lora_rank", type=int, default=32)
     p.add_argument("--lora_dropout", type=float, default=0.0)
     p.add_argument("--quantize_4bit", action="store_true", help="QLoRA: ~10 GB total")
     p.add_argument("--attn_implementation", default="sdpa", choices=["sdpa", "eager"])
+    p.add_argument("--gradient_checkpointing", action="store_true", help="trade compute for memory; lets bs>1 fit")
 
     # BTKD
     p.add_argument("--temperature", type=float, default=4.0)
     p.add_argument("--lambda_stu", type=float, default=0.5)
     p.add_argument("--schedule", default="cos2", choices=["cos2"])
+    p.add_argument("--easy_hold_frac", type=float, default=0.40,
+                   help="keep b=1 (pure easy/teacher KD) for this fraction of training; 0 = paper's raw schedule")
     p.add_argument("--calibrate_strength", type=float, default=1.0)
     p.add_argument("--logit_norm", default="none", choices=["none", "center", "std"])
     p.add_argument("--renormalize_empty_branch", action="store_true")
 
     # data plumbing
+    p.add_argument("--frames_dir", default="", help="materialised frames (default: <cache_dir>_frames)")
+    p.add_argument("--no_shuffle_frames", action="store_true", help="disable shuffling on the frames path")
     p.add_argument("--shuffle_buffer_size", type=int, default=1, help="must match the export run")
-    p.add_argument("--image_aug", action="store_true", help="differs from the teacher's view; see docs")
+    p.add_argument("--image_aug", action="store_true", help="forbidden for offline distillation")
     p.add_argument("--verify_batches", type=int, default=5, help="alignment checks against cached GT tokens")
     p.add_argument("--limit", type=int, default=-1, help="only use the first N cached samples")
+
+    # in-training evaluation (frames path only)
+    p.add_argument("--eval_steps", type=int, default=0, help="evaluate every N optimizer updates (0 = off)")
+    p.add_argument("--eval_limit", type=int, default=512)
+    p.add_argument("--eval_batch_size", type=int, default=1,
+                   help="in-training eval batch (1 is safest together with a resident 7B)")
 
     # logging
     p.add_argument("--wandb_project", default=None)
@@ -98,9 +130,21 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def build_dataloader(args, processor, vla, n_bins: int):
-    from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
+# --------------------------------------------------------------------------------------
+# Data
+# --------------------------------------------------------------------------------------
+def build_collator(processor):
     from prismatic.util.data_utils import PaddedCollatorForActionPrediction
+
+    return PaddedCollatorForActionPrediction(
+        processor.tokenizer.model_max_length,
+        processor.tokenizer.pad_token_id,
+        padding_side="right",
+    )
+
+
+def build_rlds_loader(args, processor, vla, n_bins: int):
+    from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
     from prismatic.vla.action_tokenizer import ActionTokenizer
     from prismatic.vla.datasets import RLDSBatchTransform
 
@@ -118,7 +162,7 @@ def build_dataloader(args, processor, vla, n_bins: int):
         else VicunaV15ChatPromptBuilder,
     )
     dataset = DeterministicSingleRLDSDataset(
-        args.data_root_dir,
+        Path(args.data_root_dir),
         args.dataset_name,
         batch_transform,
         resize_resolution=tuple(vla.config.image_sizes),
@@ -126,28 +170,165 @@ def build_dataloader(args, processor, vla, n_bins: int):
         train=True,
         image_aug=args.image_aug,
     )
-    collator = PaddedCollatorForActionPrediction(
-        processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
-    )
+    collator = build_collator(processor)
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch_size, collate_fn=collator, num_workers=0
     )
-    return loader, begin_idx, action_tokenizer
+    return loader, begin_idx
 
 
-def check_alignment(cached: Dict[str, torch.Tensor], gt_token: torch.Tensor, batch_idx: int, cache_ptr: int) -> None:
-    """Fail loudly if the cache and the dataset have drifted out of sync."""
-    a = cached["gt_token"]
-    b = gt_token.cpu()
-    if a.shape != b.shape or not torch.equal(a, b):
+def rlds_batches(loader, cache, n_batches: int, can_wrap: bool) -> Iterator[Tuple[Dict, Dict]]:
+    """Sequential replay of the export order (fallback path)."""
+    cache_ptr = 0
+    wraps = 0
+    for step, batch in enumerate(loader):
+        if step >= n_batches:
+            return
+        n = int(batch["input_ids"].size(0))
+        wrapped = False
+        if cache_ptr == len(cache):
+            if not can_wrap:
+                raise RuntimeError(
+                    f"cache exhausted at step {step} ({len(cache)} rows) and wrapping is disabled"
+                )
+            cache_ptr = 0
+            wraps += 1
+            wrapped = True
+            print(f"[data] cache wrapped to row 0 (pass {wraps})", flush=True)
+        if cache_ptr + n > len(cache) and not can_wrap:
+            raise RuntimeError(
+                f"cache exhausted at step {step} (row {cache_ptr}+{n} > {len(cache)})"
+            )
+        cached, cache_ptr, crossed = cache.get_window(cache_ptr, n, allow_wrap=can_wrap)
+        if crossed:
+            wraps += 1
+            wrapped = True
+            print(f"[data] cache wrapped across row 0 (pass {wraps})", flush=True)
+        batch["_wrapped"] = wrapped
+        yield batch, cached
+
+
+def frames_batches(
+    store: FrameStore,
+    cache: LogitCache,
+    collator,
+    batch_size: int,
+    n_samples: int,
+    shuffle: bool,
+    seed: int,
+) -> Iterator[Tuple[Dict, Dict]]:
+    """Random-access epochs over the materialised store (fast path).
+
+    The generator is infinite: the caller stops at ``total_steps``.  Every batch
+    draws ``idx`` once and uses it for *both* the frames and the teacher cache, so
+    the two can never drift apart.
+    """
+    n = min(int(n_samples), len(store), len(cache))
+    if batch_size <= 0:
+        raise SystemExit(f"batch_size must be positive, got {batch_size}")
+    if n <= 0:
+        raise SystemExit("no samples available for the materialised-frame path")
+    gen = torch.Generator().manual_seed(int(seed))
+    epoch = 0
+    while True:
+        perm = torch.randperm(n, generator=gen) if shuffle else torch.arange(n)
+        # Keep the tail batch (do not silently drop samples).  The step budget is
+        # computed from steps_per_epoch=ceil(n/batch_size), so every epoch covers
+        # exactly all available rows.
+        for start in range(0, n, batch_size):
+            idx = perm[start:start + batch_size]
+            batch = collator([store[int(i)] for i in idx])
+            cached = cache.get_rows(idx)
+            batch["_wrapped"] = False
+            batch["_idx"] = idx
+            yield batch, cached
+        epoch += 1
+        if epoch == 1:
+            print(
+                f"[data] frames epoch 1 done ({n} rows, "
+                f"{math.ceil(n / batch_size)} batches, batch_size={batch_size})",
+                flush=True,
+            )
+
+
+# --------------------------------------------------------------------------------------
+# Checks
+# --------------------------------------------------------------------------------------
+def check_alignment_labels(
+    cached: Dict[str, torch.Tensor],
+    labels: torch.Tensor,
+    begin_idx: int,
+    batch_idx: int,
+    spec,
+) -> None:
+    """Cheap pre-forward check: action tokens in ``labels`` must equal cached GT."""
+    mask = labels > int(begin_idx)
+    per_row = mask.sum(dim=1)
+    if not torch.all(per_row == spec.n_dims):
         raise RuntimeError(
-            f"cache/dataset misalignment at batch {batch_idx} (cache rows starting at {cache_ptr}).\n"
-            f"  cached : {a[:2, :4].tolist()} ...\n"
-            f"  dataset: {b[:2, :4].tolist()} ...\n"
-            "Export and training must both use the deterministic A6 RLDS loader "
-            "(TFDS shard shuffling off, one read/map worker) and the same dataset. "
-            "Re-export the cache with the current code."
+            f"expected {spec.n_dims} supervised action tokens per row, got {per_row.tolist()} "
+            f"at batch {batch_idx}"
         )
+    b_idx, t_idx = mask.nonzero(as_tuple=False).unbind(dim=1)
+    gt = labels[b_idx, t_idx].reshape(labels.size(0), spec.n_dims).long().cpu()
+    want = cached["gt_token"].long().cpu()
+    if gt.shape != want.shape or not torch.equal(gt, want):
+        raise RuntimeError(
+            f"cache/dataset misalignment at batch {batch_idx}.\n"
+            f"  cached : {want[:2].tolist()} ...\n"
+            f"  dataset: {gt[:2].tolist()} ...\n"
+            "Rebuild the frames with scripts/materialize_frames.py from the same cache, "
+            "or (RLDS path) re-export the cache with the deterministic loader."
+        )
+
+
+def lr_at(step: int, total_steps: int, base_lr: float, warmup_frac: float, schedule: str) -> float:
+    if total_steps <= 0:
+        return base_lr
+    warm = max(1, int(round(max(0.0, warmup_frac) * total_steps)))
+    if step < warm:
+        return base_lr * float(step + 1) / float(warm)
+    if schedule == "constant":
+        return base_lr
+    span = max(1, total_steps - warm)
+    prog = min(1.0, max(0.0, float(step - warm) / float(span)))
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * prog))
+
+
+# --------------------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------------------
+def resolve_plan(
+    n_samples: int,
+    batch_size: int,
+    epochs: float,
+    max_steps: int,
+    grad_accumulation_steps: int,
+) -> Dict[str, Any]:
+    """Turn a dataset size + epoch budget into micro-batch / optimizer-update counts.
+
+    ``--epochs > 0`` wins over ``--max_steps`` and each epoch covers *all* samples
+    (ceil, so the tail batch is not dropped).  ``--max_steps`` keeps its legacy
+    meaning: micro-batches, **not** optimizer updates - 20000 micro-batches with
+    accum=16 is only 1250 updates, which is how the first A6 run ended up at
+    ~0.38 epochs.
+    """
+    if n_samples <= 0:
+        raise SystemExit("empty training plan: no samples available")
+    steps_per_epoch = int(math.ceil(n_samples / max(1, int(batch_size))))
+    accum = max(1, int(grad_accumulation_steps))
+    if epochs and float(epochs) > 0:
+        total_steps = int(math.ceil(float(epochs) * steps_per_epoch))
+    else:
+        total_steps = int(max_steps)
+    if total_steps <= 0:
+        raise SystemExit("empty training plan: set --epochs > 0 or --max_steps > 0")
+    return {
+        "steps_per_epoch": steps_per_epoch,
+        "total_micro_batches": total_steps,
+        "optimizer_updates": int(math.ceil(total_steps / accum)),
+        "epochs_done": total_steps / float(steps_per_epoch),
+    }
 
 
 def main() -> None:
@@ -175,22 +356,19 @@ def main() -> None:
             f"cache was exported for dataset {cached_dataset!r}, but --dataset_name is "
             f"{args.dataset_name!r}; use the matching cache or re-export it"
         )
-    cached_order = cache_meta.get("data_order")
-    if cached_order != DATA_ORDER:
+    if cache_meta.get("data_order") != DATA_ORDER:
         raise SystemExit(
-            f"cache data order is {cached_order!r}, expected {DATA_ORDER!r}. "
+            f"cache data order is {cache_meta.get('data_order')!r}, expected {DATA_ORDER!r}. "
             "This cache predates deterministic RLDS ordering; re-export it with "
             "scripts/export_teacher_logits.py --overwrite."
         )
-    # Decide before shrink_to(): a cache may cover the full dataset even when this
-    # training run deliberately schedules only a prefix (--limit N).
     can_wrap_cache = cache_covers_full_epoch(cache_meta, full_cache_len, args.limit)
-    if args.limit > 0:
-        cache.shrink_to(min(args.limit, len(cache)))
     spec = cache.spec
 
     if args.check_cache_only:
-        stats = cache.analysis()
+        stats = cache.analysis(
+            max_samples=None if args.limit <= 0 else min(args.limit, full_cache_len)
+        )
         print("[check] " + json.dumps(stats, indent=2))
         bad = stats["nonfinite_logits"] > 0
         print(
@@ -199,8 +377,6 @@ def main() -> None:
         )
         raise SystemExit(1 if bad else 0)
 
-    # Only a real training run touches the dataset, so a CPU-only cache inspection
-    # must remain usable after moving the cache to a machine with a different path.
     cached_root = cache_meta.get("data_root_dir")
     if cached_root and os.path.abspath(str(cached_root)) != os.path.abspath(args.data_root_dir):
         raise SystemExit(
@@ -208,14 +384,98 @@ def main() -> None:
             f"{args.data_root_dir!r}; use the matching data root or re-export it"
         )
 
+    # ---- materialised frames (fast path) ------------------------------------------
+    frames_dir = args.frames_dir or (args.cache_dir.rstrip("/") + "_frames")
+    store: Optional[FrameStore] = None
+    expected_cache_rows = (
+        full_cache_len if args.limit <= 0 else min(int(args.limit), full_cache_len)
+    )
+    if (Path(frames_dir) / FRAMES_MANIFEST).is_file():
+        store = FrameStore(frames_dir)
+        if not store.is_complete:
+            raise SystemExit(f"frames at {frames_dir} are incomplete; re-run scripts/materialize_frames.py")
+        frames_meta = store.manifest.get("meta") or {}
+        frames_cache = frames_meta.get("cache_dir")
+        if frames_cache and os.path.abspath(str(frames_cache)) != os.path.abspath(cache.cache_dir):
+            raise SystemExit(
+                f"frames were built from cache {frames_cache!r}, but --cache_dir is "
+                f"{cache.cache_dir!r}; rebuild the frames from the matching cache"
+            )
+        if len(store) < expected_cache_rows:
+            raise SystemExit(
+                f"frames have {len(store)} rows but this run needs {expected_cache_rows}; "
+                "rebuild them with scripts/materialize_frames.py (omit --limit for full training)"
+            )
+        if args.limit <= 0 and len(store) != full_cache_len:
+            raise SystemExit(
+                f"frames have {len(store)} rows but the cache has {full_cache_len}; "
+                "they must be built from the same full export (scripts/materialize_frames.py)"
+            )
+        print(
+            f"[data] fast path: materialised frames ({len(store)} rows), "
+            f"using {expected_cache_rows}; no TFDS/JPEG decode in the loop",
+            flush=True,
+        )
+    else:
+        print(
+            f"[data] {frames_dir} not found -> falling back to the deterministic RLDS stream "
+            f"(slower: TFDS decode on the critical path).\n"
+            f"       Build it once with: python scripts/materialize_frames.py --cache_dir {args.cache_dir} "
+            f"--dataset_name {args.dataset_name}",
+            flush=True,
+        )
+
+    # Logical truncation must happen *after* the frames/cache consistency check;
+    # otherwise a full frame store plus --limit looks like a length mismatch.
+    if args.limit > 0:
+        cache.shrink_to(expected_cache_rows)
+    n_avail = expected_cache_rows
+
+    plan = resolve_plan(
+        n_avail, args.batch_size, args.epochs, args.max_steps, args.grad_accumulation_steps
+    )
+    steps_per_epoch = plan["steps_per_epoch"]
+    total_steps = plan["total_micro_batches"]
+    updates = plan["optimizer_updates"]
+    epochs_done = plan["epochs_done"]
+    print(
+        f"[plan] samples={n_avail} steps/epoch={steps_per_epoch} "
+        f"batch={args.batch_size} accum={args.grad_accumulation_steps} "
+        f"-> micro_batches={total_steps} optimizer_updates={updates} "
+        f"({epochs_done:.2f} epochs), lr={args.learning_rate} "
+        f"warmup={args.lr_warmup_frac:g} easy_hold={args.easy_hold_frac:g} T={args.temperature}",
+        flush=True,
+    )
+
     exp = args.exp_name or (
         f"btkd+{Path(args.vla_path).name}+{args.dataset_name}"
         f"+b{args.batch_size * args.grad_accumulation_steps}"
         f"+lr{args.learning_rate}+T{args.temperature}+lam{args.lambda_stu}"
+        + (f"+ep{args.epochs:g}" if args.epochs > 0 else "")
+        + (f"+hold{args.easy_hold_frac:g}" if args.easy_hold_frac > 0 else "")
         + ("+q4bit" if args.quantize_4bit else "")
     )
     run_dir = Path(args.run_root_dir) / exp
     run_dir.mkdir(parents=True, exist_ok=True)
+    resolved_config = {
+        **vars(args),
+        "resolved": {
+            "cache_dir": cache.cache_dir,
+            "frames_dir": str(Path(frames_dir).resolve()),
+            "frames_found": store is not None,
+            "n_available": n_avail,
+            "steps_per_epoch": steps_per_epoch,
+            "total_micro_batches": total_steps,
+            "optimizer_updates": updates,
+            "epochs_done": epochs_done,
+            "exp_name": exp,
+        },
+    }
+    (run_dir / "train_config.json").write_text(
+        json.dumps(resolved_config, indent=2), encoding="utf-8"
+    )
+    metrics_path = run_dir / "metrics.jsonl"
+    metrics_path.write_text("", encoding="utf-8")  # one run == one metrics file
 
     from btkd_vla.vla_glue import load_openvla_model_and_processor
 
@@ -229,6 +489,14 @@ def main() -> None:
         lora_rank=args.lora_rank,
         lora_dropout=args.lora_dropout,
     )
+    if args.gradient_checkpointing:
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+            print("[model] gradient checkpointing enabled", flush=True)
+        except Exception as exc:  # pragma: no cover - depends on peft version
+            print(f"[model] WARNING could not enable gradient checkpointing: {exc}", flush=True)
     if hasattr(model, "print_trainable_parameters"):
         model.print_trainable_parameters()
 
@@ -239,17 +507,25 @@ def main() -> None:
             "Re-export the cache with the matching --vocab_size."
         )
 
-    loader, begin_idx, action_tokenizer = build_dataloader(args, processor, model, spec.n_bins)
+    collator = build_collator(processor)
+    if store is not None:
+        from prismatic.vla.action_tokenizer import ActionTokenizer
+
+        begin_idx = ActionTokenizer(tokenizer, bins=spec.n_bins).action_token_begin_idx
+        loader = None
+    else:
+        loader, begin_idx, _ = build_rlds_loader(args, processor, model, spec.n_bins)
     if begin_idx != spec.vocab_size - spec.n_bins - 1:
         raise SystemExit(
             f"action_token_begin_idx={begin_idx} inconsistent with cached spec {spec.to_dict()}"
         )
 
+    # ---- optimisation config --------------------------------------------------------
     cfg = BTKDConfig(
         temperature=args.temperature,
         lambda_stu=args.lambda_stu,
         schedule=args.schedule,
-        total_steps=args.max_steps,
+        total_steps=total_steps,
         calibrate_strength=args.calibrate_strength,
         logit_norm=args.logit_norm,
         renormalize_empty_branch=args.renormalize_empty_branch,
@@ -265,57 +541,39 @@ def main() -> None:
         wandb = _wandb
         wandb.init(project=args.wandb_project, name=exp, config=vars(args))
 
+    if store is not None:
+        source = frames_batches(
+            store,
+            cache,
+            collator,
+            args.batch_size,
+            n_avail,
+            shuffle=not args.no_shuffle_frames,
+            seed=args.seed,
+        )
+    else:
+        source = rlds_batches(loader, cache, total_steps, can_wrap_cache)
+
     device = args.device
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    cache_ptr = 0
-    wraps = 0
     ce_hist, kd_hist, easy_hist, hard_hist, acc_hist, loss_hist = [], [], [], [], [], []
-    for step, batch in enumerate(loader):
-        if step >= args.max_steps:
+    best_acc = -1.0
+    best_step = -1
+    n_updates = 0
+    started = time.time()
+    step = -1
+
+    for step, (batch, cached) in enumerate(source):
+        if step >= total_steps:
             break
 
-        n = int(batch["input_ids"].size(0))
-        wrapped = False
-        if cache_ptr == len(cache):
-            # Exact end of a pass. Restart at row 0 and verify the first batch of the
-            # new pass before training on it.
-            if not can_wrap_cache:
-                raise RuntimeError(
-                    f"cache exhausted at step {step} ({len(cache)} rows). The cache does "
-                    "not cover one full dataset pass (exported with --limit, or the dataset "
-                    "has more samples). Re-export the full dataset, or keep --limit small "
-                    "enough for the scheduled steps."
-                )
-            cache_ptr = 0
-            wraps += 1
-            wrapped = True
-            print(f"[data] cache wrapped to row 0 (pass {wraps}); verifying alignment", flush=True)
-
-        if cache_ptr + n > len(cache) and not can_wrap_cache:
-            raise RuntimeError(
-                f"cache exhausted at step {step} (row {cache_ptr}+{n} > {len(cache)}). "
-                "The cache does not cover one full dataset pass (exported with --limit, or the "
-                "dataset has more samples). Re-export the full dataset, or keep --limit small "
-                "enough for the scheduled steps."
-            )
-        window_start = cache_ptr
-        try:
-            cached, cache_ptr, crossed = cache.get_window(
-                cache_ptr, n, allow_wrap=can_wrap_cache
-            )
-        except (ValueError, IndexError) as exc:
-            raise RuntimeError(f"cannot read a cache window at step {step}: {exc}") from exc
-        if crossed:
-            # The RLDS stream repeats forever, so a batch may straddle the dataset
-            # boundary as [tail..., head...]. get_window reproduces that exact order.
-            wraps += 1
-            wrapped = True
-            print(f"[data] cache wrapped across row 0 (pass {wraps}); verifying alignment", flush=True)
         labels = batch["labels"]
+        if step < args.verify_batches or batch.get("_wrapped"):
+            check_alignment_labels(cached, labels, begin_idx, step, spec)
 
-        b = cosine_square_schedule(step, args.max_steps)
+        b = cosine_square_schedule_hold(step, total_steps, args.easy_hold_frac)
         use_amp = device.startswith("cuda")
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
@@ -326,7 +584,9 @@ def main() -> None:
                 labels=labels.to(device),
             )
             ce = out.loss
-            action_logits, gt_token, _ = extract_action_logits(out.logits, labels.to(device), begin_idx, spec)
+            action_logits, gt_token, _ = extract_action_logits(
+                out.logits, labels.to(device), begin_idx, spec
+            )
             kd = btkd_term(
                 action_logits,
                 cached["teacher_logits"].to(device=device, dtype=torch.float32),
@@ -338,57 +598,121 @@ def main() -> None:
             )
             loss = total_loss(ce, kd, cfg)
 
-        if step < args.verify_batches or wrapped:
-            check_alignment(cached, gt_token, step, window_start)
-
+        did_update = (
+            (step + 1) % args.grad_accumulation_steps == 0
+            or (step + 1) >= total_steps
+        )
         (loss / args.grad_accumulation_steps).backward()
-        if (step + 1) % args.grad_accumulation_steps == 0:
+        if did_update:
+            lr = lr_at(step, total_steps, args.learning_rate, args.lr_warmup_frac, args.lr_schedule)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            n_updates += 1
 
         loss_hist.append(float(loss.item()))
         ce_hist.append(float(ce.item()))
         kd_hist.append(float(kd["loss"].item()))
         easy_hist.append(float(kd["easy"].item()))
         hard_hist.append(float(kd["hard"].item()))
-        acc_hist.append(teacher_token_accuracy(cached["teacher_argmax_token"], cached["gt_token"]))
+        acc_hist.append(float(teacher_token_accuracy(cached["teacher_argmax_token"], cached["gt_token"])))
 
         if step % args.log_steps == 0:
             window = slice(-args.log_steps, None)
-            msg = (
-                f"[step {step:6d}] loss={sum(loss_hist[window])/max(1,len(loss_hist[window])):.4f} "
-                f"ce={sum(ce_hist[window])/max(1,len(ce_hist[window])):.4f} "
-                f"kd={sum(kd_hist[window])/max(1,len(kd_hist[window])):.4f} "
-                f"easy={sum(easy_hist[window])/max(1,len(easy_hist[window])):.4f} "
-                f"hard={sum(hard_hist[window])/max(1,len(hard_hist[window])):.4f} "
-                f"b={b:.3f} teacher_tok_acc={sum(acc_hist[window])/max(1,len(acc_hist[window])):.3f} "
-                f"easy_frac={kd['easy_frac']:.3f}"
+            progress = (step + 1) / max(1, total_steps)
+            elapsed = time.time() - started
+            eta = elapsed / max(1e-9, progress) - elapsed
+            record = {
+                "step": step,
+                "update": n_updates,
+                "progress": round(progress, 4),
+                "epoch": round((step + 1) * args.batch_size / max(1, n_avail), 3),
+                "loss": sum(loss_hist[window]) / max(1, len(loss_hist[window])),
+                "ce": sum(ce_hist[window]) / max(1, len(ce_hist[window])),
+                "kd": sum(kd_hist[window]) / max(1, len(kd_hist[window])),
+                "kd_easy": sum(easy_hist[window]) / max(1, len(easy_hist[window])),
+                "kd_hard": sum(hard_hist[window]) / max(1, len(hard_hist[window])),
+                "b": round(b, 4),
+                "easy_frac": round(float(kd["easy_frac"]), 4),
+                "teacher_tok_acc": sum(acc_hist[window]) / max(1, len(acc_hist[window])),
+                "lr": optimizer.param_groups[0]["lr"],
+                "eta_min": round(eta / 60.0, 1),
+            }
+            print(
+                f"[step {step:6d} upd {n_updates:5d}] loss={record['loss']:.4f} ce={record['ce']:.4f} "
+                f"kd={record['kd']:.4f} easy={record['kd_easy']:.4f} hard={record['kd_hard']:.4f} "
+                f"b={record['b']:.3f} easy_frac={record['easy_frac']:.3f} lr={record['lr']:.2e} "
+                f"ep={record['epoch']:.2f} eta={record['eta_min']:.0f}min",
+                flush=True,
             )
-            print(msg, flush=True)
+            with metrics_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "train", **record}) + "\n")
             if wandb is not None:
-                wandb.log(
-                    {
-                        "loss": float(loss.item()),
-                        "ce": float(ce.item()),
-                        "kd": float(kd["loss"].item()),
-                        "kd_easy": float(kd["easy"].item()),
-                        "kd_hard": float(kd["hard"].item()),
-                        "b": b,
-                        "easy_frac": kd["easy_frac"],
-                        "lr": optimizer.param_groups[0]["lr"],
-                        "step": step,
-                    }
-                )
+                wandb.log(record)
 
-        if args.save_steps > 0 and step > 0 and step % args.save_steps == 0:
-            ckpt = run_dir / f"checkpoint-{step}"
+        # ---- in-training evaluation (frames path only) ---------------------------
+        if args.eval_steps > 0 and did_update and n_updates % args.eval_steps == 0:
+            if store is None:
+                print("[eval] skipped: in-training eval needs a materialised frame store", flush=True)
+            else:
+                from btkd_vla.evaluate import offline_eval_frames
+
+                t0 = time.time()
+                metrics = offline_eval_frames(
+                    model,
+                    collator,
+                    store,
+                    cache,
+                    spec,
+                    begin_idx,
+                    device,
+                    batch_size=args.eval_batch_size,
+                    limit=args.eval_limit,
+                    progress_every=0,
+                )
+                acc = metrics["student_token_acc"]
+                mean6 = sum(metrics["per_dim_acc"][:6]) / 6.0
+                print(
+                    f"[eval @ update {n_updates} (step {step})] student={acc:.4f} dim0-5={mean6:.4f} "
+                    f"teacher={metrics['teacher_token_acc']:.4f} "
+                    f"agreement={metrics['student_teacher_agreement']:.4f} "
+                    f"({time.time() - t0:.0f}s, {args.eval_limit} rows)",
+                    flush=True,
+                )
+                with metrics_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"type": "eval", "step": step, "update": n_updates, **metrics}) + "\n")
+                if wandb is not None:
+                    wandb.log({"eval_step": step, "eval_update": n_updates, **{f"eval_{k}": v for k, v in metrics.items()
+                                                     if isinstance(v, (int, float))}})
+                if acc > best_acc:
+                    best_acc = acc
+                    best_step = step
+                    model.save_pretrained(run_dir / "best")
+                    print(
+                        f"[eval] new best -> {run_dir / 'best'} "
+                        f"(update {n_updates}, step {step}, acc {acc:.4f})",
+                        flush=True,
+                    )
+                model.train()
+
+        if args.save_steps > 0 and did_update and n_updates % args.save_steps == 0:
+            ckpt = run_dir / f"checkpoint-{n_updates}"
             model.save_pretrained(ckpt)
-            print(f"[save] {ckpt}", flush=True)
+            print(f"[save] {ckpt} (update {n_updates}, step {step})", flush=True)
 
     final = run_dir / "final"
     model.save_pretrained(final)
-    print(f"[done] adapter saved to {final}")
+    elapsed = time.time() - started
+    print(
+        f"[done] adapter saved to {final} ({elapsed/3600:.2f} h, "
+        f"{step + 1} micro-batches, {n_updates} optimizer updates)"
+    )
+    if best_acc >= 0:
+        print(f"[done] best eval acc {best_acc:.4f} at step {best_step} -> {run_dir / 'best'}")
+    else:
+        print("[done] no in-training eval ran; use eval mode to compare final/ and checkpoints")
 
 
 if __name__ == "__main__":

@@ -1,27 +1,37 @@
 #!/usr/bin/env bash
 # =============================================================================
-# A6 单卡运行器（一块 24GB 3090 Ti 跑通 导出 → 校验 → QLoRA 蒸馏）
+# A6 单卡运行器（一块 24GB 3090 Ti 跑通 导出 → 校验 → 物化 → 蒸馏）
 #
-#   bash run_a6_single_gpu.sh export --dataset bridge_orig    # 1) 导出 teacher logits
-#   bash run_a6_single_gpu.sh check  --dataset bridge_orig    # 2) 只校验缓存
-#   bash run_a6_single_gpu.sh train  --dataset bridge_orig    # 3) QLoRA 蒸馏
-#   bash run_a6_single_gpu.sh eval   --dataset bridge_orig    # 4) 离线验证 adapter（对比缓存 teacher）
-#   bash run_a6_single_gpu.sh all    --dataset bridge_orig    # 1+2+3 顺序执行
+#   bash run_a6_single_gpu.sh export       --dataset bridge_orig  # 1) 导出 teacher logits
+#   bash run_a6_single_gpu.sh check        --dataset bridge_orig  # 2) 只校验缓存
+#   bash run_a6_single_gpu.sh materialize  --dataset bridge_orig  # 3) 把帧物化到磁盘（只跑一次）
+#   bash run_a6_single_gpu.sh train        --dataset bridge_orig  # 4) BTKD 蒸馏（自动用 frames 快路径）
+#   bash run_a6_single_gpu.sh eval         --dataset bridge_orig  # 5) 离线验证 adapter（对比缓存 teacher）
+#   bash run_a6_single_gpu.sh all          --dataset bridge_orig  # 1+2+3+4 顺序执行
 #
 #   默认只把一张卡暴露给进程：CUDA_VISIBLE_DEVICES=<GPU>，脚本内一律 --device cuda:0
 #   GPU 选择: --gpu 0 | --gpu 3 | --gpu auto（挑当前最空闲的一张）| --gpu all
 #
 # 24GB 的推荐值（脚本默认）
 #   导出: batch_size=2（OOM 自动降 1）  显存 ~18-20GB
-#   训练: batch_size=4, grad_accum=4, --quantize_4bit  显存 ~10-12GB
+#   训练: bf16-LoRA, batch_size=1, grad_accum=16, gradient checkpointing（约 12GB）
+#         若能装 bitsandbytes 则 4-bit QLoRA，batch_size=4 / accum 4
+#
+# 为什么需要 materialize
+#   * 缓存对齐要求 RLDS 用确定性顺序（单读/单 map worker），训练时每步都要解 JPEG，
+#     一张 3090 Ti 上只有个位数 step/s。
+#   * materialize 只遍历一次，把 input_ids/labels/pixel_values(fp16) 写成按 cache 行号
+#     对齐的分片；之后训练直接按行号随机读，缓存和帧天然对齐，可以安全 shuffle、跑多 epoch。
+#   * 磁盘代价：约 3*224*224*2B ≈ 300KB/样本 → 5.3 万样本约 16GB。
 #
 # 注意
 #   * 导出阶段不要加 --quantize_4bit：4-bit 噪声会污染 teacher logits（见 docs §9.4）
-#   * A6 使用确定性 RLDS 顺序（TFDS 分片不 shuffle、读/map 各 1 个 worker）
-#   * --shuffle_buffer_size 必须为 1、不要 --image_aug：否则缓存与数据集错位
+#   * 导出的 --shuffle_buffer_size 必须为 1、不要 --image_aug：否则缓存与数据集错位
 #   * --resume 按 manifest 中实际落盘行数续写，可以更换 batch size
 #   * 旧版缓存（CACHE_VERSION/data_order 不匹配）会自动备份为 *.legacy_时间戳 后重导
 #   * 完整缓存可跨 epoch 回绕并在每次回绕时重新校验 GT token；--limit 禁止回绕
+#   * 训练默认按 epoch 计步（--epochs 2），不再是 --max-steps 20000 的 micro-batch 语义
+#   * final/ 只是最后一刻的权重；请优先用 best/（训练中评估选出的最好 checkpoint）
 # =============================================================================
 set -Eeuo pipefail
 
@@ -46,7 +56,19 @@ TRAIN_GA=4
 EVAL_BS=4
 ADAPTER=""
 MAX_STEPS=20000
+MAX_STEPS_SET=0
 SAVE_STEPS=2000
+EPOCHS=2
+EPOCHS_SET=0
+EVAL_STEPS=2000
+EVAL_LIMIT=512
+EASY_HOLD=0.4
+TEMPERATURE=2.0
+LR=5e-4
+LR_WARMUP=0.03
+FRAMES=""
+MATERIALIZE=1
+MAT_SHARD=1000
 PY=""
 DRY_RUN=0
 PY_EXTRA=()
@@ -61,7 +83,7 @@ warn() { printf "${C_WARN}[WARN]${C_OFF} %s\n" "$*"; }
 die()  { printf "${C_ERR}[FAIL]${C_OFF} %s\n" "$*" >&2; exit 1; }
 
 usage() {
-    sed -n '3,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     cat <<'TIP'
 
 参数:
@@ -76,7 +98,18 @@ usage() {
   --grad-accum N          梯度累积（默认 4）
   --adapter DIR           eval 用的 LoRA adapter（默认自动取 runs_btkd/*/final 最新一个）
   --eval-batch-size N     eval batch（默认 4；不传 --limit 时只验证前 512 条）
-  --max-steps N           训练步数（默认 20000）
+  --epochs N              训练几个 epoch（默认 2；设为 0 才用 --max-steps）
+  --max-steps N           micro-batch 步数（仅在 --epochs 0 时生效）
+  --easy-hold-frac F      前 F 比例保持 easy 分支，再余弦降到 hard（默认 0.4）
+  --temperature T         KD 温度（默认 2.0；4.0 = 论文原值，hard 分支权重更大）
+  --learning-rate LR      学习率（默认 5e-4）
+  --save-steps N          每 N 个 optimizer update 存 checkpoint（默认 2000）
+  --eval-steps N          每 N 个 optimizer update 做一次离线评估（默认 2000；0=关闭）
+  --eval-limit N          训练中评估用的样本数（默认 512）
+  --frames-dir DIR        frames 目录（默认 <cache>_frames）
+  --materialize-shards N  materialize 分片大小（默认 1000 行/片）
+  --no-materialize        train 前不自动物化 frames（沿用已有 frames 或回退 RLDS）
+  --overwrite-frames      materialize 时覆盖已存在的 frames
   --python PATH           指定 python（默认用 conda 环境里的）
   --env-name NAME         conda 环境名（默认 BTKD / $BTKD_ENV_NAME）
   --train-arg ARG         透传给 train_btkd_student.py（可重复）
@@ -97,7 +130,18 @@ while [[ $# -gt 0 ]]; do
         --adapter)          ADAPTER="$2"; shift 2 ;;
         --eval-batch-size)  EVAL_BS="$2"; shift 2 ;;
         --grad-accum)       TRAIN_GA="$2"; shift 2 ;;
-        --max-steps)        MAX_STEPS="$2"; shift 2 ;;
+        --max-steps)        MAX_STEPS="$2"; MAX_STEPS_SET=1; shift 2 ;;
+        --epochs)           EPOCHS="$2"; EPOCHS_SET=1; shift 2 ;;
+        --easy-hold-frac)   EASY_HOLD="$2"; shift 2 ;;
+        --temperature)      TEMPERATURE="$2"; shift 2 ;;
+        --learning-rate)    LR="$2"; shift 2 ;;
+        --save-steps)       SAVE_STEPS="$2"; shift 2 ;;
+        --eval-steps)       EVAL_STEPS="$2"; shift 2 ;;
+        --eval-limit)       EVAL_LIMIT="$2"; shift 2 ;;
+        --frames-dir)       FRAMES="$2"; shift 2 ;;
+        --materialize-shards) MAT_SHARD="$2"; shift 2 ;;
+        --no-materialize)   MATERIALIZE=0; shift ;;
+        --overwrite-frames) MAT_OVERWRITE=1; shift ;;
         --python)           PY="$2"; shift 2 ;;
         --env-name)         ENV_NAME="$2"; shift 2 ;;
         --train-arg)        PY_EXTRA+=("$2"); shift 2 ;;
@@ -108,9 +152,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "${CACHE}" == "" ]] && CACHE="${SCRIPT_DIR}/caches/${DATASET}_teacher"
+[[ "${FRAMES}" == "" ]] && FRAMES="${CACHE%/}_frames"
+MAT_OVERWRITE="${MAT_OVERWRITE:-0}"
+if (( EPOCHS_SET == 1 && MAX_STEPS_SET == 1 )); then
+    die "同时给了 --epochs 和 --max-steps；只保留一个（--epochs 0 才用 --max-steps）"
+fi
 
 if [[ "${MODE}" == "help" ]]; then usage; exit 0; fi
-case "${MODE}" in export|check|train|eval|all) ;; *) die "第一个参数必须是 export|check|train|eval|all，收到: ${MODE}" ;; esac
+case "${MODE}" in export|check|materialize|train|eval|all) ;; *) die "第一个参数必须是 export|check|materialize|train|eval|all，收到: ${MODE}" ;; esac
 
 exec > >(tee -a "${LOG_FILE}") 2>&1
 trap 'die "脚本在第 $LINENO 行失败；日志: ${LOG_FILE}"' ERR
@@ -175,6 +224,7 @@ if command -v nvidia-smi >/dev/null 2>&1 && [[ "${GPU}" != "all" ]]; then
     fi
 fi
 ok "缓存目录: ${CACHE}"
+ok "frames 目录: ${FRAMES}"
 ok "日志: ${LOG_FILE}"
 
 # ---------------------------------------------------------------------------
@@ -303,17 +353,99 @@ do_check() {
     if [[ "${DRY_RUN}" == "0" ]]; then ok "缓存校验通过"; fi
 }
 
+do_materialize() {
+    step "3. 物化训练帧（CPU，一次性；之后训练不再碰 TFDS）"
+    if [[ -f "${FRAMES}/manifest.json" && "${MAT_OVERWRITE}" == "0" ]]; then
+        local state
+        state="$("${PY}" - "${FRAMES}" <<'PY'
+import sys
+from btkd_vla.frames import FrameStore
+s = FrameStore(sys.argv[1])
+print("complete" if s.is_complete else "incomplete", len(s))
+PY
+)"
+        case "${state}" in
+            complete*)
+                ok "frames 已完整（${state#complete } 行），跳过: ${FRAMES}"
+                ok "如需重建加 --overwrite-frames"
+                return 0 ;;
+            *)
+                warn "检测到未完成的 frames（${state}），将重建"
+                MAT_OVERWRITE=1 ;;
+        esac
+    fi
+    local limit_args=()
+    (( LIMIT > 0 )) && limit_args=(--limit "${LIMIT}")
+    local -a overwrite_args=()
+    if [[ "${MAT_OVERWRITE}" == "1" ]]; then
+        warn "将覆盖已有 frames: ${FRAMES}"
+        overwrite_args=(--overwrite)
+    fi
+
+    local -a cmd=("${PY}" scripts/materialize_frames.py
+        --cache_dir "${CACHE}"
+        --out_dir "${FRAMES}"
+        --dataset_name "${DATASET}"
+        --data_root_dir "${DATA_ROOT}"
+        --vla_path "${TEACHER}"
+        --shard_size "${MAT_SHARD}"
+        "${limit_args[@]}"
+        "${overwrite_args[@]}")
+
+    local t0=$SECONDS
+    exec_cmd "${cmd[@]}"
+    if [[ "${DRY_RUN}" == "0" ]]; then
+        ok "物化完成: ${FRAMES}（$(( (SECONDS - t0) / 60 )) 分钟）"
+        du -sh "${FRAMES}" 2>/dev/null || true
+    fi
+}
+
 do_train() {
     local quant=(--quantize_4bit)
-    if [[ "${DRY_RUN}" == "0" ]] && ! "${PY}" -c "import bitsandbytes" >/dev/null 2>&1; then
+    if ! "${PY}" -c "import bitsandbytes" >/dev/null 2>&1; then
         warn "bitsandbytes 不可用：退回 bf16 LoRA，并把 batch 降到 1 / accum 提到 16"
         quant=(); TRAIN_BS=1; TRAIN_GA=16
     fi
-    step "3. 蒸馏训练（bs=${TRAIN_BS} x accum ${TRAIN_GA}，$( (( ${#quant[@]} > 0 )) && echo 4-bit-QLoRA || echo bf16-LoRA)）"
+
+    # 没有可用 frames 就自动先物化（除非显式 --no-materialize）
+    if [[ "${MATERIALIZE}" == "1" ]]; then
+        local frames_complete=0
+        if [[ -f "${FRAMES}/manifest.json" ]]; then
+            frames_complete="$("${PY}" - "${FRAMES}" <<'PY'
+import sys
+from btkd_vla.frames import FrameStore
+try:
+    s = FrameStore(sys.argv[1], verbose=False)
+    print(1 if s.is_complete else 0)
+except Exception:
+    print(0)
+PY
+)"
+        fi
+        if [[ "${frames_complete}" == "1" ]]; then
+            ok "使用已有 frames: ${FRAMES}"
+        else
+            do_materialize
+        fi
+    else
+        warn "--no-materialize：训练将回退到 RLDS 流式读取（慢，仅调试用）"
+    fi
+
+    local -a schedule_args=(--epochs "${EPOCHS}")
+    if (( EPOCHS == 0 )); then
+        schedule_args=(--max_steps "${MAX_STEPS}")
+    fi
+    local -a lr_args=(--lr_schedule cosine --lr_warmup_frac "${LR_WARMUP}"
+                     --learning_rate "${LR}")
+    local plan_label
+    if (( EPOCHS > 0 )); then plan_label="epochs=${EPOCHS}"; else plan_label="max_steps=${MAX_STEPS}"; fi
+
+    step "4. BTKD 蒸馏训练（bs=${TRAIN_BS} x accum ${TRAIN_GA}，$( (( ${#quant[@]} > 0 )) && echo 4-bit-QLoRA || echo bf16-LoRA)，${plan_label}）"
     local limit_args=()
     (( LIMIT > 0 )) && limit_args=(--limit "${LIMIT}")
     local -a cmd=("${PY}" scripts/train_btkd_student.py
         --cache_dir "${CACHE}"
+        --frames_dir "${FRAMES}"
         --dataset_name "${DATASET}"
         --data_root_dir "${DATA_ROOT}"
         --vla_path "${TEACHER}"
@@ -322,12 +454,20 @@ do_train() {
         --batch_size "${TRAIN_BS}"
         --grad_accumulation_steps "${TRAIN_GA}"
         "${quant[@]}"
-        --max_steps "${MAX_STEPS}"
+        --gradient_checkpointing
+        "${schedule_args[@]}"
         --save_steps "${SAVE_STEPS}"
+        --eval_steps "${EVAL_STEPS}"
+        --eval_limit "${EVAL_LIMIT}"
+        --temperature "${TEMPERATURE}"
+        --easy_hold_frac "${EASY_HOLD}"
+        "${lr_args[@]}"
         --device cuda:0
         "${PY_EXTRA[@]}")
     exec_cmd "${cmd[@]}"
-    if [[ "${DRY_RUN}" == "0" ]]; then ok "训练完成，检查 runs_btkd/ 下的 checkpoint"; fi
+    if [[ "${DRY_RUN}" == "0" ]]; then
+        ok "训练完成，检查 runs_btkd/ 下的 best/ final/ 与 metrics.jsonl"
+    fi
 }
 
 do_eval() {
@@ -357,13 +497,15 @@ do_eval() {
 }
 
 case "${MODE}" in
-    export) do_export ;;
-    check)  do_check ;;
-    train)  do_train ;;
-    eval)   do_eval ;;
-    all)    do_export; do_check; do_train ;;
+    export)      do_export ;;
+    check)       do_check ;;
+    materialize) do_materialize ;;
+    train)       do_train ;;
+    eval)        do_eval ;;
+    all)         do_export; do_check; do_materialize; do_train ;;
 esac
 
 echo
 printf "日志: %s\n" "${LOG_FILE}"
-echo "提示：单卡 24GB 想再省显存 → --batch-size 1 / 训练加 --train-arg '--lora_rank 16'"
+echo "提示：单卡 24GB 想再省显存 → 训练加 --train-arg '--lora_rank 16'"
+echo "提示：优先用 best/ 而不是 final/（final 是最后一刻权重，可能已在 hard 分支上回退）"

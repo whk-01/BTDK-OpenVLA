@@ -10,6 +10,7 @@ import math
 import os
 import sys
 import tempfile
+from itertools import islice
 
 import torch
 
@@ -24,14 +25,18 @@ from btkd_vla.core import (  # noqa: E402
     btkd_term,
     calibrate3_logits,
     cosine_square_schedule,
+    cosine_square_schedule_hold,
     masked_mean,
     per_token_kl,
     split_easy_hard,
     teacher_token_accuracy,
     total_loss,
 )
+from btkd_vla.evaluate import MetricAccumulator  # noqa: E402
+from btkd_vla.frames import FrameStore, FrameStoreWriter  # noqa: E402
 from btkd_vla.spec import ActionSpec, BTKDConfig  # noqa: E402
 from btkd_vla.vla_glue import extract_action_logits  # noqa: E402
+from scripts.train_btkd_student import frames_batches, resolve_plan  # noqa: E402
 
 SPEC = ActionSpec(n_bins=256, n_dims=7, vocab_size=32000)
 torch.manual_seed(0)
@@ -264,6 +269,15 @@ def test_cache_roundtrip():
         assert torch.equal(one["gt_token"], gt[9:12])
         assert torch.equal(c[2]["gt_token"], gt[2])
 
+        # random-access gather: unordered, duplicated and cross-shard indices
+        pick = torch.tensor([22, 0, 10, 10, 5, 9])
+        gathered = c.get_rows(pick)
+        assert torch.equal(gathered["gt_token"], gt[pick])
+        assert torch.equal(gathered["teacher_argmax_token"], am[pick])
+        assert torch.allclose(
+            gathered["teacher_logits"].float(), lg[pick], rtol=1e-3, atol=1e-3
+        )
+
         # resume appends rather than restarting
         with LogitCacheWriter(tmp, SPEC, shard_size=10, resume=True) as w2:
             w2.add(gt[:3], lg[:3], am[:3])
@@ -390,6 +404,132 @@ def test_cache_wrap_safety():
     capped = {"dataset_length": 100, "target_samples": 100, "limit": 100000}
     assert cache_covers_full_epoch(capped, 100, train_limit=-1)
     print("  ok  cache wrap requires a full export and no training --limit")
+
+
+def test_cosine_square_schedule_hold():
+    total = 100
+    assert abs(cosine_square_schedule_hold(0, total, 0.0) - 1.0) < 1e-12
+    assert abs(cosine_square_schedule_hold(50, total, 0.0) - 0.5) < 1e-12
+    assert abs(cosine_square_schedule_hold(100, total, 0.0)) < 1e-12
+
+    # 40% easy plateau, then the same cosine-square decay over the remaining 60%.
+    assert cosine_square_schedule_hold(0, total, 0.4) == 1.0
+    assert cosine_square_schedule_hold(40, total, 0.4) == 1.0
+    assert abs(cosine_square_schedule_hold(70, total, 0.4) - 0.5) < 1e-12
+    assert abs(cosine_square_schedule_hold(100, total, 0.4)) < 1e-12
+    print("  ok  easy-hold schedule: b=1 plateau then cos^2 decay to 0")
+
+
+def test_frame_store_roundtrip():
+    torch.manual_seed(77)
+    n = 11
+    with tempfile.TemporaryDirectory() as tmp:
+        gt = torch.randint(SPEC.offset, SPEC.vocab_size, (n, SPEC.n_dims))
+        ids = [torch.tensor([i, 1000 + i]) for i in range(n)]
+        pix = [torch.rand(3, 8, 8) for _ in range(n)]
+        with FrameStoreWriter(tmp, image_shape=(3, 8, 8), dataset="dummy", shard_size=4) as w:
+            for i in range(n):
+                w.add(ids[i], gt[i], pix[i])
+        store = FrameStore(tmp, verbose=False)
+        assert store.is_complete and len(store) == n and len(store.shards) == 3
+        for i in (0, 3, 4, 10, 6):
+            row = store[i]
+            assert torch.equal(row["input_ids"], ids[i])
+            assert torch.equal(row["labels"], gt[i])
+            assert torch.allclose(row["pixel_values"], pix[i].half().float())
+        print("  ok  frame-store round-trip across shards")
+
+
+def test_frames_batches_share_one_index():
+    """Frame row i and cache row i must be fetched from the same integer index."""
+    torch.manual_seed(78)
+    n, bs = 10, 4
+    gt = torch.stack(
+        [torch.arange(SPEC.offset + i, SPEC.offset + i + SPEC.n_dims) for i in range(n)]
+    )
+    lg = torch.randn(n, SPEC.n_dims, SPEC.n_bins)
+
+    def toy_collator(rows):
+        return {
+            "input_ids": torch.stack([r["input_ids"] for r in rows]),
+            "labels": torch.stack([r["labels"] for r in rows]),
+            "attention_mask": torch.ones(len(rows), 2, dtype=torch.long),
+            "pixel_values": torch.stack([r["pixel_values"] for r in rows]),
+        }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cache_dir = os.path.join(tmp, "cache")
+        frames_dir = os.path.join(tmp, "frames")
+        with LogitCacheWriter(cache_dir, SPEC, shard_size=3) as w:
+            w.add(gt, lg, gt)
+        with FrameStoreWriter(frames_dir, image_shape=(3, 2, 2), shard_size=3) as w:
+            for i in range(n):
+                w.add(
+                    torch.tensor([i, 100 + i]),
+                    gt[i],
+                    torch.zeros(3, 2, 2),
+                )
+        cache = LogitCache(cache_dir, verbose=False)
+        store = FrameStore(frames_dir, verbose=False)
+
+        for shuffle in (False, True):
+            batches = list(
+                islice(
+                    frames_batches(store, cache, toy_collator, bs, n, shuffle=shuffle, seed=5),
+                    3,
+                )
+            )
+            seen = torch.cat([b["_idx"] for b, _ in batches])
+            assert sorted(seen.tolist()) == list(range(n)), "one epoch must cover every row"
+            assert [len(b["input_ids"]) for b, _ in batches] == [4, 4, 2]
+            for batch, cached in batches:
+                idx = batch["_idx"]
+                assert torch.equal(batch["input_ids"][:, 0], idx)
+                assert torch.equal(batch["labels"], gt[idx])
+                assert torch.equal(cached["gt_token"], gt[idx])
+                assert torch.allclose(cached["teacher_logits"], lg[idx].half())
+    print("  ok  frames/cache use the same index (ordered, shuffled, tail batch)")
+
+
+def test_metric_accumulator():
+    gt = torch.stack(
+        [torch.arange(SPEC.offset + 1, SPEC.offset + 1 + SPEC.n_dims)]
+    )
+    tea = gt.clone()
+    logits = torch.full((1, SPEC.n_dims, SPEC.n_bins), -100.0)
+    for d in range(SPEC.n_dims):
+        logits[0, d, d + 1] = 100.0  # correct: gt column is d+1 here
+    logits[0, 1, 0] = 200.0         # dim 1 deliberately wrong
+    acc = MetricAccumulator(SPEC)
+    acc.update(logits, gt, tea, ce=1.25)
+    out = acc.result()
+    assert abs(out["student_token_acc"] - (SPEC.n_dims - 1) / SPEC.n_dims) < 1e-12
+    assert out["teacher_token_acc"] == 1.0
+    assert abs(out["student_teacher_agreement"] - (SPEC.n_dims - 1) / SPEC.n_dims) < 1e-12
+    assert out["per_dim_acc"] == [1.0, 0.0] + [1.0] * (SPEC.n_dims - 2)
+    assert out["teacher_out_of_space_frac"] == 0.0
+    print("  ok  shared metric accumulator")
+
+
+def test_resolve_plan_epochs():
+    # LIBERO spatial: 52970 samples, bs=1, accum=16, 2 epochs
+    plan = resolve_plan(52970, 1, 2.0, 20000, 16)
+    assert plan["steps_per_epoch"] == 52970
+    assert plan["total_micro_batches"] == 105940
+    assert plan["optimizer_updates"] == math.ceil(105940 / 16) == 6622
+    assert abs(plan["epochs_done"] - 2.0) < 1e-12
+
+    # tail batch must not be dropped: 101 samples / bs=4 -> 26 steps, not 25
+    plan = resolve_plan(101, 4, 1.0, 20000, 1)
+    assert plan["steps_per_epoch"] == 26
+    assert plan["total_micro_batches"] == 26
+
+    # legacy semantics: --max_steps counts micro-batches, and reproduces the old 0.38 epoch run
+    legacy = resolve_plan(52970, 1, 0, 20000, 16)
+    assert legacy["total_micro_batches"] == 20000
+    assert legacy["optimizer_updates"] == 1250
+    assert abs(legacy["epochs_done"] - 20000 / 52970) < 1e-12
+    print("  ok  epoch/max_steps plan conversion")
 
 
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

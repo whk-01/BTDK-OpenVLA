@@ -31,6 +31,7 @@ from .spec import ActionSpec, BTKDConfig
 
 __all__ = [
     "cosine_square_schedule",
+    "cosine_square_schedule_hold",
     "split_easy_hard",
     "calibrate3_logits",
     "per_token_kl",
@@ -50,6 +51,33 @@ def cosine_square_schedule(step: int, total_steps: int) -> float:
         return 1.0
     frac = min(max(float(step) / float(total_steps), 0.0), 1.0)
     return math.cos((math.pi / 2.0) * frac) ** 2
+
+
+def cosine_square_schedule_hold(
+    step: int, total_steps: int, hold_frac: float = 0.0
+) -> float:
+    """``b(t)`` with an initial easy plateau.
+
+    ``hold_frac=0`` reproduces :func:`cosine_square_schedule` (the paper's raw
+    schedule).  ``hold_frac=0.4`` keeps ``b == 1`` for the first 40% of training -
+    i.e. the student first has to actually absorb the teacher - and only then
+    decays to ``b == 0`` (calibrate3 / hard branch) over the remaining 60%.
+
+    Rationale: with a short budget the raw schedule spends the tail fitting
+    ``calibrate3(teacher)``, which is *deliberately* off the ground-truth
+    distribution, so a student that has not converged on the teacher yet loses
+    ground-truth accuracy in the last third of the run.
+    """
+    if total_steps <= 0:
+        return 1.0
+    hold = min(max(float(hold_frac), 0.0), 0.95)
+    frac = min(max(float(step) / float(total_steps), 0.0), 1.0)
+    if frac <= hold:
+        return 1.0
+    span = 1.0 - hold
+    if span <= 1e-9:
+        return 0.0
+    return math.cos((math.pi / 2.0) * ((frac - hold) / span)) ** 2
 
 
 # --------------------------------------------------------------------------------------

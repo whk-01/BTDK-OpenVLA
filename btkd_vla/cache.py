@@ -401,6 +401,49 @@ class LogitCache:
             "teacher_argmax_token": torch.cat(ams, dim=0),
         }
 
+    def get_rows(self, indices) -> Dict[str, torch.Tensor]:
+        """Gather an arbitrary set of rows (unordered, with repeats).
+
+        Used by shuffled training over a materialised frame store: the frame index
+        and the cache row are the same integer, so alignment is guaranteed by
+        construction instead of by replaying the dataset stream.
+        """
+        idx = torch.as_tensor(indices, dtype=torch.long).reshape(-1)
+        n = int(idx.numel())
+        if n == 0:
+            raise ValueError("get_rows needs at least one index")
+        if int(idx.min()) < 0 or int(idx.max()) >= self.n_samples:
+            raise IndexError(
+                f"indices outside [0, {self.n_samples}) while gathering {n} rows"
+            )
+        starts = torch.tensor(
+            [int(s["start"]) for s in self.shards], dtype=torch.long
+        )
+        sid = torch.searchsorted(starts, idx, right=True) - 1
+        gt: Optional[torch.Tensor] = None
+        am: Optional[torch.Tensor] = None
+        logits: Optional[torch.Tensor] = None
+        for shard_id in sid.unique(sorted=True).tolist():
+            sel = (sid == int(shard_id)).nonzero(as_tuple=False).flatten()
+            blob = self._shard(int(shard_id))
+            off = idx[sel] - starts[int(shard_id)]
+            shard_gt = blob["gt_token"].long()[off]
+            shard_am = blob["teacher_argmax_token"].long()[off]
+            teacher = blob["teacher_logits"][off]
+            if gt is None:
+                # Rows are [D], logits [D, n_bins]; allocate once from the first
+                # shard encountered (all shards share this shape).
+                gt = torch.empty((n, shard_gt.size(1)), dtype=torch.long)
+                am = torch.empty((n, shard_am.size(1)), dtype=torch.long)
+                logits = torch.empty(
+                    (n, teacher.size(1), teacher.size(2)), dtype=teacher.dtype
+                )
+            gt.index_copy_(0, sel, shard_gt)
+            am.index_copy_(0, sel, shard_am)
+            logits.index_copy_(0, sel, teacher)
+        assert gt is not None and am is not None and logits is not None
+        return {"gt_token": gt, "teacher_logits": logits, "teacher_argmax_token": am}
+
     def get_window(self, start: int, n: int, allow_wrap: bool = False):
         """Read ``n`` consecutive rows, optionally crossing the end back to row 0.
 
