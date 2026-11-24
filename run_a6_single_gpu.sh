@@ -55,6 +55,7 @@ TRAIN_BS=4
 TRAIN_GA=4
 EVAL_BS=4
 ADAPTER=""
+# 仅作为 --epochs 0 时的兜底；默认训练按 EPOCHS 计（见下方 schedule_args）
 MAX_STEPS=20000
 MAX_STEPS_SET=0
 SAVE_STEPS=2000
@@ -156,6 +157,11 @@ done
 MAT_OVERWRITE="${MAT_OVERWRITE:-0}"
 if (( EPOCHS_SET == 1 && MAX_STEPS_SET == 1 )); then
     die "同时给了 --epochs 和 --max-steps；只保留一个（--epochs 0 才用 --max-steps）"
+fi
+# 只给 --max-steps 时自动切回旧的步数语义，避免被默认的 EPOCHS=2 静默吃掉
+if (( MAX_STEPS_SET == 1 && EPOCHS_SET == 0 )); then
+    EPOCHS=0
+    warn "--max-steps 已给出：自动切到 --epochs 0（按 micro-batch 计步）"
 fi
 
 if [[ "${MODE}" == "help" ]]; then usage; exit 0; fi
