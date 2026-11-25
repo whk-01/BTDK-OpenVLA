@@ -351,6 +351,14 @@ teacher before the schedule moves into the `calibrate3` hard branch; `--lr_warmu
 adds a linear warmup. In-training eval every `--eval_steps` updates writes the best adapter to
 `best/` — prefer `best/` over `final/`.
 
+Data-pipeline defaults (2026-11-25): the frames path shuffles **shard order, then rows
+inside each shard** (`--frame_shuffle shard`) and keeps 8 shards mmap-ed
+(`--frame_cache_shards 8`). A global `randperm` with `batch_size=1` reloads a 300 MB
+shard on almost every step (~51k `torch.load` calls per epoch instead of 53), which is
+what makes the GPU sit at 0-30 % utilisation. `--profile_steps N` prints the
+`data / forward / backward` split for the first N micro-batches so the bottleneck is
+visible instead of guessed.
+
 Export semantics: without `--limit`, exactly one dataset pass is cached. If an export is
 interrupted, `--resume` continues from the rows recorded in `manifest.json` (not from the
 approximate `progress.json`), and the export batch size may be changed. A complete cache may

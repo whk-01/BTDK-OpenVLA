@@ -28,7 +28,7 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -134,7 +134,7 @@ class FrameStoreWriter:
 class FrameStore(Dataset):
     """Random-access view over a materialised frame store."""
 
-    def __init__(self, root: str, verbose: bool = True, max_open_shards: int = 2) -> None:
+    def __init__(self, root: str, verbose: bool = True, max_open_shards: int = 8) -> None:
         self.root = Path(root)
         path = self.root / MANIFEST
         if not path.is_file():
@@ -150,9 +150,14 @@ class FrameStore(Dataset):
         self.image_shape = self.manifest.get("image_shape")
         if self.n_samples > 0 and not self.shards:
             raise ValueError(f"{self.root}: manifest claims {self.n_samples} samples but has no shards")
-        self.max_open_shards = max(1, int(max_open_shards))
+        # ``<= 0`` keeps every shard mapped for the whole run.  ``mmap=True`` only
+        # maps pages, so this costs virtual address space + one small tensor header
+        # per sample, not 16 GB of RSS.
+        self.max_open_shards = int(max_open_shards)
         self._open: Dict[int, Dict[str, Any]] = {}
         self._order: List[int] = []
+        self.shard_loads = 0
+        self.shard_hits = 0
         if verbose:
             print(
                 f"[btkd] loaded frames {self.root}: {self.n_samples} samples, "
@@ -167,17 +172,48 @@ class FrameStore(Dataset):
     def _shard(self, index: int) -> Dict[str, Any]:
         blob = self._open.get(index)
         if blob is not None:
+            self.shard_hits += 1
+            # True LRU: a hit must move the shard to the back, otherwise the
+            # eviction order degenerates to FIFO and the shard we just used can be
+            # dropped on the very next (different) access.
+            if not self._order or self._order[-1] != index:
+                try:
+                    self._order.remove(index)
+                except ValueError:  # pragma: no cover - defensive
+                    pass
+                self._order.append(index)
             return blob
         fname = self.shards[index]["file"]
+        self.shard_loads += 1
         blob = torch.load(
             self.root / fname, map_location="cpu", mmap=True, weights_only=False
         )
         self._open[index] = blob
         self._order.append(index)
-        while len(self._order) > self.max_open_shards:
-            evict = self._order.pop(0)
-            self._open.pop(evict, None)
+        if self.max_open_shards > 0:
+            while len(self._order) > self.max_open_shards:
+                evict = self._order.pop(0)
+                self._open.pop(evict, None)
         return blob
+
+    @property
+    def stats(self) -> Dict[str, int]:
+        """Diagnostics: how many shard loads vs. cache hits since the last reset."""
+        return {
+            "open": len(self._open),
+            "loads": self.shard_loads,
+            "hits": self.shard_hits,
+        }
+
+    def reset_stats(self) -> None:
+        self.shard_loads = 0
+        self.shard_hits = 0
+
+    def shard_span(self, index: int) -> Tuple[int, int]:
+        """``[start, start + n)`` global row range covered by shard ``index``."""
+        shard = self.shards[int(index)]
+        start = int(shard["start"])
+        return start, start + int(shard["n"])
 
     def _locate(self, idx: int):
         if idx < 0:

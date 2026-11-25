@@ -491,6 +491,48 @@ def test_frames_batches_share_one_index():
     print("  ok  frames/cache use the same index (ordered, shuffled, tail batch)")
 
 
+def test_frames_lru_and_shard_local_permutation():
+    """Shard cache must be LRU (not FIFO) and shard-local shuffling must cover all rows."""
+    from btkd_vla.frames import FrameStore
+    from scripts.train_btkd_student import shard_local_permutation
+
+    with tempfile.TemporaryDirectory() as tmp:
+        frames_dir = os.path.join(tmp, "frames")
+        with FrameStoreWriter(frames_dir, image_shape=(3, 2, 2), shard_size=2) as w:
+            for i in range(6):
+                w.add(torch.tensor([i, i]), torch.zeros(SPEC.n_dims, dtype=torch.long),
+                      torch.zeros(3, 2, 2))
+        store = FrameStore(frames_dir, verbose=False, max_open_shards=2)
+        # shard0 rows 0-1, shard1 rows 2-3, shard2 rows 4-5
+        for i in (0, 1, 2, 3, 0, 1):
+            store[i]
+        assert store.stats["loads"] == 2, store.stats
+        for i in (4, 5):                      # must evict shard1, not the hot shard0
+            store[i]
+        store[0]
+        assert store.stats["loads"] == 3, store.stats   # FIFO would need 4 here
+        assert store.stats["hits"] == 6, store.stats
+
+        store_all = FrameStore(frames_dir, verbose=False, max_open_shards=0)
+        for i in range(6):
+            store_all[i]
+        for i in range(6):
+            store_all[i]
+        assert store_all.stats["loads"] == 3, store_all.stats
+
+        gen = torch.Generator().manual_seed(0)
+        perm = shard_local_permutation(store, 6, gen)
+        assert sorted(perm.tolist()) == list(range(6))
+        blocks = [set(perm[i:i + 2].tolist()) for i in range(0, 6, 2)]
+        assert all(len(b) == 2 for b in blocks)
+        assert {frozenset(b) for b in blocks} == {frozenset({0, 1}), frozenset({2, 3}), frozenset({4, 5})}
+
+        # --limit style truncation: n smaller than the store still covers [0, n)
+        perm = shard_local_permutation(store, 5, torch.Generator().manual_seed(1))
+        assert sorted(perm.tolist()) == list(range(5))
+    print("  ok  frames LRU cache + shard-local shuffle covers every row")
+
+
 def test_metric_accumulator():
     gt = torch.stack(
         [torch.arange(SPEC.offset + 1, SPEC.offset + 1 + SPEC.n_dims)]

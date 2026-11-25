@@ -70,6 +70,9 @@ LR_WARMUP=0.03
 FRAMES=""
 MATERIALIZE=1
 MAT_SHARD=1000
+FRAME_SHARDS=8
+FRAME_SHUFFLE="shard"
+PROFILE_STEPS=0
 PY=""
 DRY_RUN=0
 PY_EXTRA=()
@@ -109,6 +112,9 @@ usage() {
   --eval-limit N          训练中评估用的样本数（默认 512）
   --frames-dir DIR        frames 目录（默认 <cache>_frames）
   --materialize-shards N  materialize 分片大小（默认 1000 行/片）
+  --frame-shards N       训练时同时打开的 frames 分片数（默认 8；0=全部常驻）
+  --frame-shuffle MODE   shard（默认，分片内乱序，最快）| global（全局乱序，慢）
+  --profile-steps N      前 N 步打印 data/fwd/bwd 耗时拆分（默认 0=关闭）
   --no-materialize        train 前不自动物化 frames（沿用已有 frames 或回退 RLDS）
   --overwrite-frames      materialize 时覆盖已存在的 frames
   --python PATH           指定 python（默认用 conda 环境里的）
@@ -141,6 +147,9 @@ while [[ $# -gt 0 ]]; do
         --eval-limit)       EVAL_LIMIT="$2"; shift 2 ;;
         --frames-dir)       FRAMES="$2"; shift 2 ;;
         --materialize-shards) MAT_SHARD="$2"; shift 2 ;;
+        --frame-shards)     FRAME_SHARDS="$2"; shift 2 ;;
+        --frame-shuffle)    FRAME_SHUFFLE="$2"; shift 2 ;;
+        --profile-steps)    PROFILE_STEPS="$2"; shift 2 ;;
         --no-materialize)   MATERIALIZE=0; shift ;;
         --overwrite-frames) MAT_OVERWRITE=1; shift ;;
         --python)           PY="$2"; shift 2 ;;
@@ -467,6 +476,9 @@ PY
         --eval_limit "${EVAL_LIMIT}"
         --temperature "${TEMPERATURE}"
         --easy_hold_frac "${EASY_HOLD}"
+        --frame_cache_shards "${FRAME_SHARDS}"
+        --frame_shuffle "${FRAME_SHUFFLE}"
+        --profile_steps "${PROFILE_STEPS}"
         "${lr_args[@]}"
         --device cuda:0
         "${PY_EXTRA[@]}")

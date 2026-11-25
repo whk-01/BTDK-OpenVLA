@@ -57,7 +57,6 @@ from btkd_vla.cache import DATA_ORDER, LogitCache, cache_covers_full_epoch  # no
 from btkd_vla.core import (  # noqa: E402
     btkd_term,
     cosine_square_schedule_hold,
-    teacher_token_accuracy,
     total_loss,
 )
 from btkd_vla.frames import MANIFEST as FRAMES_MANIFEST  # noqa: E402
@@ -107,9 +106,31 @@ def build_parser() -> argparse.ArgumentParser:
     # data plumbing
     p.add_argument("--frames_dir", default="", help="materialised frames (default: <cache_dir>_frames)")
     p.add_argument("--no_shuffle_frames", action="store_true", help="disable shuffling on the frames path")
+    p.add_argument(
+        "--frame_shuffle",
+        default="shard",
+        choices=["shard", "global"],
+        help=(
+            "shard: randomise shard order, then rows inside each shard (each shard is "
+            "read once per epoch -> fast); global: one permutation over all rows, which "
+            "reloads a shard on almost every step when batch_size is small"
+        ),
+    )
+    p.add_argument(
+        "--frame_cache_shards",
+        type=int,
+        default=8,
+        help="frame shards kept mmap-ed at once (0 = all; bigger = fewer torch.load calls)",
+    )
     p.add_argument("--shuffle_buffer_size", type=int, default=1, help="must match the export run")
     p.add_argument("--image_aug", action="store_true", help="forbidden for offline distillation")
     p.add_argument("--verify_batches", type=int, default=5, help="alignment checks against cached GT tokens")
+    p.add_argument(
+        "--profile_steps",
+        type=int,
+        default=0,
+        help="for the first N micro-batches, sync the GPU and report data/forward/backward seconds",
+    )
     p.add_argument("--limit", type=int, default=-1, help="only use the first N cached samples")
 
     # in-training evaluation (frames path only)
@@ -208,6 +229,34 @@ def rlds_batches(loader, cache, n_batches: int, can_wrap: bool) -> Iterator[Tupl
         yield batch, cached
 
 
+def shard_local_permutation(store: FrameStore, n: int, gen: torch.Generator) -> torch.Tensor:
+    """Shuffle *shards*, then rows inside each shard.
+
+    A global ``randperm`` over 53k rows touches a random 300 MB shard on almost
+    every ``batch_size=1`` step.  With only a handful of open shards that turns the
+    input pipeline into ``torch.load`` + page-fault bound work and the GPU idles
+    (the classic 0-30 % utilisation sawtooth).  Keeping the rows of one shard
+    together means each shard is opened once per epoch while the sample order is
+    still random.
+    """
+    n_shards = len(store.shards)
+    if n_shards <= 1:
+        return torch.randperm(n, generator=gen)
+    shard_order = torch.randperm(n_shards, generator=gen).tolist()
+    out = torch.empty(n, dtype=torch.long)
+    pos = 0
+    for si in shard_order:
+        start, stop = store.shard_span(si)
+        if start >= n:
+            continue
+        count = min(stop, n) - start
+        out[pos : pos + count] = start + torch.randperm(count, generator=gen)
+        pos += count
+    if pos != n:  # pragma: no cover - manifest would be inconsistent
+        raise RuntimeError(f"shard-local permutation covered {pos} rows, expected {n}")
+    return out
+
+
 def frames_batches(
     store: FrameStore,
     cache: LogitCache,
@@ -216,6 +265,7 @@ def frames_batches(
     n_samples: int,
     shuffle: bool,
     seed: int,
+    shard_local: bool = True,
 ) -> Iterator[Tuple[Dict, Dict]]:
     """Random-access epochs over the materialised store (fast path).
 
@@ -231,7 +281,12 @@ def frames_batches(
     gen = torch.Generator().manual_seed(int(seed))
     epoch = 0
     while True:
-        perm = torch.randperm(n, generator=gen) if shuffle else torch.arange(n)
+        if not shuffle:
+            perm = torch.arange(n)
+        elif shard_local:
+            perm = shard_local_permutation(store, n, gen)
+        else:
+            perm = torch.randperm(n, generator=gen)
         # Keep the tail batch (do not silently drop samples).  The step budget is
         # computed from steps_per_epoch=ceil(n/batch_size), so every epoch covers
         # exactly all available rows.
@@ -244,11 +299,15 @@ def frames_batches(
             yield batch, cached
         epoch += 1
         if epoch == 1:
+            stats = getattr(store, "stats", {})
             print(
                 f"[data] frames epoch 1 done ({n} rows, "
-                f"{math.ceil(n / batch_size)} batches, batch_size={batch_size})",
+                f"{math.ceil(n / batch_size)} batches, batch_size={batch_size}, "
+                f"shard loads={stats.get('loads', '?')}, hits={stats.get('hits', '?')})",
                 flush=True,
             )
+            if hasattr(store, "reset_stats"):
+                store.reset_stats()
 
 
 # --------------------------------------------------------------------------------------
@@ -391,7 +450,7 @@ def main() -> None:
         full_cache_len if args.limit <= 0 else min(int(args.limit), full_cache_len)
     )
     if (Path(frames_dir) / FRAMES_MANIFEST).is_file():
-        store = FrameStore(frames_dir)
+        store = FrameStore(frames_dir, max_open_shards=args.frame_cache_shards)
         if not store.is_complete:
             raise SystemExit(f"frames at {frames_dir} are incomplete; re-run scripts/materialize_frames.py")
         frames_meta = store.manifest.get("meta") or {}
@@ -550,6 +609,7 @@ def main() -> None:
             n_avail,
             shuffle=not args.no_shuffle_frames,
             seed=args.seed,
+            shard_local=(args.frame_shuffle == "shard"),
         )
     else:
         source = rlds_batches(loader, cache, total_steps, can_wrap_cache)
@@ -558,16 +618,43 @@ def main() -> None:
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    ce_hist, kd_hist, easy_hist, hard_hist, acc_hist, loss_hist = [], [], [], [], [], []
+    # Keep these as GPU scalars: calling ``.item()`` once per micro-batch forces a
+    # full stream synchronisation (with bs=1 x accum=16 that is ~8 syncs/step) and
+    # stops the CPU from preparing the next sample while the GPU works.  One sync
+    # per log window is enough.
+    ce_hist: List[torch.Tensor] = []
+    kd_hist: List[torch.Tensor] = []
+    easy_hist: List[torch.Tensor] = []
+    hard_hist: List[torch.Tensor] = []
+    acc_hist: List[torch.Tensor] = []
+    loss_hist: List[torch.Tensor] = []
+
+    def _window_mean(hist: List[torch.Tensor], window: slice) -> float:
+        vals = hist[window]
+        if not vals:
+            return 0.0
+        return float(torch.stack([v.detach().float().reshape(()) for v in vals]).mean().item())
+
     best_acc = -1.0
     best_step = -1
     n_updates = 0
     started = time.time()
     step = -1
+    source_iter = iter(source)
+    profiling = bool(args.profile_steps) and device.startswith("cuda")
+    prof_data = prof_fwd = prof_bwd = 0.0
+    prof_n = 0
 
-    for step, (batch, cached) in enumerate(source):
-        if step >= total_steps:
+    while step + 1 < total_steps:
+        step += 1
+        if profiling and step < args.profile_steps:
+            torch.cuda.synchronize()
+        t_data0 = time.perf_counter()
+        try:
+            batch, cached = next(source_iter)
+        except StopIteration:  # pragma: no cover - the generators are infinite
             break
+        t_data1 = time.perf_counter()
 
         labels = batch["labels"]
         if step < args.verify_batches or batch.get("_wrapped"):
@@ -598,6 +685,10 @@ def main() -> None:
             )
             loss = total_loss(ce, kd, cfg)
 
+        if profiling and step < args.profile_steps:
+            torch.cuda.synchronize()
+            t_fwd1 = time.perf_counter()
+
         did_update = (
             (step + 1) % args.grad_accumulation_steps == 0
             or (step + 1) >= total_steps
@@ -612,12 +703,22 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             n_updates += 1
 
-        loss_hist.append(float(loss.item()))
-        ce_hist.append(float(ce.item()))
-        kd_hist.append(float(kd["loss"].item()))
-        easy_hist.append(float(kd["easy"].item()))
-        hard_hist.append(float(kd["hard"].item()))
-        acc_hist.append(float(teacher_token_accuracy(cached["teacher_argmax_token"], cached["gt_token"])))
+        if profiling and step < args.profile_steps:
+            torch.cuda.synchronize()
+            t_bwd1 = time.perf_counter()
+            prof_data += t_data1 - t_data0
+            prof_fwd += t_fwd1 - t_data1
+            prof_bwd += t_bwd1 - t_fwd1
+            prof_n += 1
+
+        loss_hist.append(loss.detach())
+        ce_hist.append(ce.detach())
+        kd_hist.append(kd["loss"].detach())
+        easy_hist.append(kd["easy"].detach())
+        hard_hist.append(kd["hard"].detach())
+        acc_hist.append(
+            (cached["teacher_argmax_token"] == cached["gt_token"]).float().mean().detach()
+        )
 
         if step % args.log_steps == 0:
             window = slice(-args.log_steps, None)
@@ -629,22 +730,32 @@ def main() -> None:
                 "update": n_updates,
                 "progress": round(progress, 4),
                 "epoch": round((step + 1) * args.batch_size / max(1, n_avail), 3),
-                "loss": sum(loss_hist[window]) / max(1, len(loss_hist[window])),
-                "ce": sum(ce_hist[window]) / max(1, len(ce_hist[window])),
-                "kd": sum(kd_hist[window]) / max(1, len(kd_hist[window])),
-                "kd_easy": sum(easy_hist[window]) / max(1, len(easy_hist[window])),
-                "kd_hard": sum(hard_hist[window]) / max(1, len(hard_hist[window])),
+                "loss": _window_mean(loss_hist, window),
+                "ce": _window_mean(ce_hist, window),
+                "kd": _window_mean(kd_hist, window),
+                "kd_easy": _window_mean(easy_hist, window),
+                "kd_hard": _window_mean(hard_hist, window),
                 "b": round(b, 4),
                 "easy_frac": round(float(kd["easy_frac"]), 4),
-                "teacher_tok_acc": sum(acc_hist[window]) / max(1, len(acc_hist[window])),
+                "teacher_tok_acc": _window_mean(acc_hist, window),
                 "lr": optimizer.param_groups[0]["lr"],
                 "eta_min": round(eta / 60.0, 1),
             }
+            if prof_n:
+                record["prof_data_s"] = round(prof_data / prof_n, 3)
+                record["prof_fwd_s"] = round(prof_fwd / prof_n, 3)
+                record["prof_bwd_s"] = round(prof_bwd / prof_n, 3)
             print(
                 f"[step {step:6d} upd {n_updates:5d}] loss={record['loss']:.4f} ce={record['ce']:.4f} "
                 f"kd={record['kd']:.4f} easy={record['kd_easy']:.4f} hard={record['kd_hard']:.4f} "
                 f"b={record['b']:.3f} easy_frac={record['easy_frac']:.3f} lr={record['lr']:.2e} "
-                f"ep={record['epoch']:.2f} eta={record['eta_min']:.0f}min",
+                f"ep={record['epoch']:.2f} eta={record['eta_min']:.0f}min"
+                + (
+                    f" | prof data={prof_data / prof_n:.2f}s fwd={prof_fwd / prof_n:.2f}s "
+                    f"bwd={prof_bwd / prof_n:.2f}s (first {prof_n} steps)"
+                    if prof_n
+                    else ""
+                ),
                 flush=True,
             )
             with metrics_path.open("a", encoding="utf-8") as fh:

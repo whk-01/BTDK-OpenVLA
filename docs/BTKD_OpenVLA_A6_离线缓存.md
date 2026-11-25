@@ -220,7 +220,7 @@ bash run_a6_single_gpu.sh eval        --dataset bridge_orig   # 5) 离线验证 
 │   ├── eval_btkd_student.py       # 第 4 步：离线验证 adapter（对比缓存 teacher）
 │   └── smoke_test_a6.py           # CPU 全链路冒烟测试（不需要模型和数据）
 ├── tests/
-│   └── test_core.py               # 24 个单元测试（数学 + 缓存 + frames + 调度 + 指标）
+│   └── test_core.py               # 25 个单元测试（数学 + 缓存 + frames + 调度 + 指标）
 └── docs/
     └── BTKD_OpenVLA_A6_离线缓存.md  # 本文档
 ```
@@ -521,6 +521,9 @@ python scripts/eval_btkd_student.py \
 | `--easy_hold_frac` | 0.40 | 前 40% 保持 `b=1`（纯 easy 分支），之后才按 `cos²` 退火到 hard；0 = 论文原始调度 |
 | `--lr_schedule` | cosine | cosine / constant |
 | `--lr_warmup_frac` | 0.03 | 前 3% 线性 warmup，避免一上来就 5e-4 冲掉预训练 |
+| `--frame_shuffle` | `shard`（脚本默认） | `shard`：先打乱分片顺序、再打乱分片内行序（每个分片一个 epoch 只 `torch.load` 一次）；`global`：全表 `randperm`，bs=1 时几乎每步都要换分片 |
+| `--frame_cache_shards` | 8（脚本默认） | 同时 mmap 的 frames 分片数；`0` = 全部常驻（mmap 只占虚拟地址空间） |
+| `--profile_steps` | 0 | 前 N 个 micro-batch 做 CUDA 同步，日志里打印 `data/fwd/bwd` 耗时拆分，用来判断瓶颈 |
 | `--save_steps` | 2000 | 每 N 次 **optimizer update** 存 `checkpoint-N` |
 | `--eval_steps` | 0（脚本传 2000） | 每 N 次 update 做一次离线评估，最好的存 `best/`；0 = 关闭 |
 | `--eval_limit` | 512 | 训练中评估的样本数（越大越准越慢） |
@@ -648,6 +651,45 @@ easy/hard 判定会失真。默认关闭；如果你确实想用增强，请把�
 按顺序尝试：`--batch_size 1` → `--grad_accumulation_steps` 翻倍 → `--quantize_4bit` →
 换 16 GB 以上的卡。注意 7B LoRA 本身的固定开销就有 ~16 GB（权重 15 GB），降到 8 GB 只能靠 QLoRA。
 
+### 9.6 训练几个小时没结束、GPU 利用率在 0–30% 之间跳
+
+先算清楚「慢」到底是多少：日志里 `[step 40000 upd 2500]` 的 step 是 **micro-batch**
+（bs=1 × accum=16 时 16 个 micro-batch 才 1 次 update），一个 epoch 是 52970 个 micro-batch。
+24 小时 4 万步 ≈ **2.16 s/步**，不是卡死。
+
+GPU 利用率低不是显存问题，是 **GPU 在等数据**。`nvidia-smi` 按 1 秒采样，一个 2 s 的
+step 里 GPU 只忙 0.3–0.6 s，平均值自然就在 0–30% 之间锯齿。
+
+最常见的原因（本仓库 2026-11-25 已修）：
+
+| 原因 | 现象 | 修法 |
+|---|---|---|
+| `--frame_shuffle global` + `--frame_cache_shards 2` | 53 个分片、只开 2 个槽，随机取一条样本几乎每步都 `torch.load` 一个新分片（模拟：一个 epoch 要 load **51015 次**，而不是 53 次） | 默认已改为 `--frame_shuffle shard`，一个 epoch 只 load 53 次 |
+| LRU 退化成 FIFO | 刚用过的分片被下一个访问踢掉，顺序读也会反复重载 | `FrameStore._shard()` 命中时已移到队尾 |
+| 每步 5–8 次 `.item()` | 每次 `.item()` 强制 `cudaStreamSynchronize`，CPU/GPU 无法重叠 | 已改为按 log 窗口聚合，一次同步 |
+| bs=1 | 每步的 Python/collator/copy 开销无法摊薄 | 24 GB 上可试 `--train-batch-size 2 --grad-accum 8` |
+
+排查命令：
+
+```bash
+tail -40 logs/train_ep1.out          # 看最后一行 eta 和 prof 拆分
+grep -c '^\[step' logs/train_ep1.out # 已打印的日志行数（每 log_steps 行一条）
+nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv -l 1
+free -g; nproc
+```
+
+想量化瓶颈，下次训练加 `--profile-steps 50`，日志会变成：
+
+```text
+... eta=470min | prof data=1.42s fwd=0.31s bwd=0.42s (first 50 steps)
+```
+
+`data` 远大于 `fwd+bwd` 就是数据管线的问题（分片/磁盘/Python）；三者都很大才是算力不够。
+
+> 已经跑到一半的进程**不要 kill**：训练脚本没有 resume，重启等于从头再来；
+> 而 `save_steps`/`eval_steps` 每 2000 次 update 落盘的 `checkpoint-*` 和 `best/` 都在。
+> 让当前这一轮跑完，下一轮 `git pull` 后用新默认值即可。
+
 ---
 
 ## 10. 验证清单（已在 `BTKD` 环境实际执行）
@@ -655,7 +697,7 @@ easy/hard 判定会失真。默认关闭；如果你确实想用增强，请把�
 ```bash
 conda activate BTKD && cd /home/whk/BTKD
 
-python tests/test_core.py          # 24/24 passed
+python tests/test_core.py          # 25/25 passed
 python scripts/smoke_test_a6.py    # SMOKE TEST PASSED
 ```
 
