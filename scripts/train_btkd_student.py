@@ -801,6 +801,11 @@ def main() -> None:
                     best_acc = acc
                     best_step = step
                     model.save_pretrained(run_dir / "best")
+                    (run_dir / "best" / "train_state.json").write_text(
+                        json.dumps({"update": n_updates, "step": step, "eval_acc": acc})
+                        + "\n",
+                        encoding="utf-8",
+                    )
                     print(
                         f"[eval] new best -> {run_dir / 'best'} "
                         f"(update {n_updates}, step {step}, acc {acc:.4f})",
@@ -809,9 +814,17 @@ def main() -> None:
                 model.train()
 
         if args.save_steps > 0 and did_update and n_updates % args.save_steps == 0:
+            # NOTE: the suffix is the OPTIMIZER UPDATE index, not the micro-batch step.
             ckpt = run_dir / f"checkpoint-{n_updates}"
             model.save_pretrained(ckpt)
-            print(f"[save] {ckpt} (update {n_updates}, step {step})", flush=True)
+            (ckpt / "train_state.json").write_text(
+                json.dumps({"update": n_updates, "step": step}) + "\n", encoding="utf-8"
+            )
+            print(
+                f"[save] {ckpt} (update {n_updates}, micro-step {step}; "
+                f"dir name uses the update index)",
+                flush=True,
+            )
 
     final = run_dir / "final"
     model.save_pretrained(final)

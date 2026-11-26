@@ -58,10 +58,10 @@ ADAPTER=""
 # 仅作为 --epochs 0 时的兜底；默认训练按 EPOCHS 计（见下方 schedule_args）
 MAX_STEPS=20000
 MAX_STEPS_SET=0
-SAVE_STEPS=2000
+SAVE_STEPS=500
 EPOCHS=2
 EPOCHS_SET=0
-EVAL_STEPS=2000
+EVAL_STEPS=500
 EVAL_LIMIT=512
 EASY_HOLD=0.4
 TEMPERATURE=2.0
@@ -107,8 +107,9 @@ usage() {
   --easy-hold-frac F      前 F 比例保持 easy 分支，再余弦降到 hard（默认 0.4）
   --temperature T         KD 温度（默认 2.0；4.0 = 论文原值，hard 分支权重更大）
   --learning-rate LR      学习率（默认 5e-4）
-  --save-steps N          每 N 个 optimizer update 存 checkpoint（默认 2000）
-  --eval-steps N          每 N 个 optimizer update 做一次离线评估（默认 2000；0=关闭）
+  --save-steps N          每 N 个 optimizer update 存一个 checkpoint（默认 500；
+                          注意单位是 optimizer update，不是 micro-batch step）
+  --eval-steps N          每 N 个 optimizer update 做一次离线评估（默认 500；0=关闭）
   --eval-limit N          训练中评估用的样本数（默认 512）
   --frames-dir DIR        frames 目录（默认 <cache>_frames）
   --materialize-shards N  materialize 分片大小（默认 1000 行/片）
@@ -497,8 +498,15 @@ do_eval() {
         warn "未指定 --limit：eval 默认只验证前 512 条（全量会非常慢，可用 --limit -1 显式开启）"
     fi
     if [[ -z "${ADAPTER}" ]]; then
-        ADAPTER="$(ls -td "${SCRIPT_DIR}"/runs_btkd/*/final 2>/dev/null | head -1 || true)"
-        [[ -n "${ADAPTER}" ]] || die "找不到 adapter：请用 --adapter 指定 runs_btkd/<exp>/final 或 checkpoint-XXXX"
+        # 先定位最新的实验目录，再优先 best/（best 是按 eval acc 选出来的，final 可能已回退）
+        local exp_dir
+        exp_dir="$(ls -td "${SCRIPT_DIR}"/runs_btkd/*/ 2>/dev/null | head -1 || true)"
+        if [[ -n "${exp_dir}" && -d "${exp_dir%/}/best" ]]; then
+            ADAPTER="${exp_dir%/}/best"
+        elif [[ -n "${exp_dir}" && -d "${exp_dir%/}/final" ]]; then
+            ADAPTER="${exp_dir%/}/final"
+        fi
+        [[ -n "${ADAPTER}" ]] || die "找不到 adapter：请用 --adapter 指定 runs_btkd/<exp>/best、final 或 checkpoint-XXXX"
         warn "未指定 --adapter，自动使用最新的: ${ADAPTER}"
     fi
     local -a cmd=("${PY}" scripts/eval_btkd_student.py

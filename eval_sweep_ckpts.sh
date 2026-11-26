@@ -2,10 +2,10 @@
 # =============================================================================
 # 扫 4 个 checkpoint 的离线验证（固定通过 run_a6_single_gpu.sh 调用，GPU 默认 2）
 #
-#   bash eval_sweep_ckpts.sh                    # 默认 GPU=2，扫 2000/8000/14000/18000
+#   bash eval_sweep_ckpts.sh                    # 默认 GPU=2，自动挑 4 个 checkpoint
 #   bash eval_sweep_ckpts.sh --gpu 1            # 换卡
 #   bash eval_sweep_ckpts.sh --limit 128        # 更快
-#   bash eval_sweep_ckpts.sh 2000 8000          # 只扫指定 checkpoint
+#   bash eval_sweep_ckpts.sh 500 1500 3000      # 只扫指定 update 号（=目录名后缀）
 #   bash eval_sweep_ckpts.sh --dry-run          # 只打印将执行的命令
 #
 # 关键点：run_a6_single_gpu.sh 内部会 `export CUDA_VISIBLE_DEVICES=<--gpu>`，
@@ -26,7 +26,16 @@ if [[ -z "${CACHE}" ]]; then
     done
     CACHE="${CACHE:-${SCRIPT_DIR}/caches/${DATASET}_teacher}"
 fi
-EXP="${EXP:-${SCRIPT_DIR}/runs_btkd/btkd+openvla-7b+${DATASET}+b16+lr0.0005+T4.0+lam0.5}"
+# 默认自动挑最近一次真正存了 adapter 的实验目录（名字里的超参会变，不要写死）
+if [[ -z "${EXP:-}" ]]; then
+    for d in $(ls -td "${SCRIPT_DIR}"/runs_btkd/*/ 2>/dev/null); do
+        if compgen -G "${d}checkpoint-*" >/dev/null || [[ -d "${d}best" ]]; then
+            EXP="${d%/}"
+            break
+        fi
+    done
+fi
+EXP="${EXP:-}"
 ENV_NAME="${ENV_NAME:-whk_BTKD}"
 LIMIT="${LIMIT:-512}"
 EVAL_BS="${EVAL_BS:-1}"
@@ -47,7 +56,24 @@ while [[ $# -gt 0 ]]; do
         *)            CKPTS+=("$1"); shift ;;
     esac
 done
-[[ ${#CKPTS[@]} -eq 0 ]] && CKPTS=(2000 8000 14000 18000)
+# 不指定时自动发现已保存的 checkpoint-<update>，最多挑 4 个（均匀取样）。
+# 注意：目录名后缀是 optimizer update 序号，不是 micro-batch step。
+if [[ ${#CKPTS[@]} -eq 0 ]]; then
+    mapfile -t ALL_CKPTS < <(
+        find "${EXP}" -mindepth 1 -maxdepth 1 -type d -name 'checkpoint-*' -printf '%f\n' 2>/dev/null \
+            | sed 's/^checkpoint-//' | sort -n
+    )
+    if [[ ${#ALL_CKPTS[@]} -eq 0 ]]; then
+        echo "[FAIL] ${EXP} 下没有 checkpoint-*；该次训练可能只存了 best/ 和 final/。" >&2
+        echo "       想有中间快照，训练时用小一点的 --save-steps（单位=optimizer update）。" >&2
+        exit 1
+    elif [[ ${#ALL_CKPTS[@]} -le 4 ]]; then
+        CKPTS=("${ALL_CKPTS[@]}")
+    else
+        n=${#ALL_CKPTS[@]}
+        CKPTS=("${ALL_CKPTS[0]}" "${ALL_CKPTS[n/3]}" "${ALL_CKPTS[2*n/3]}" "${ALL_CKPTS[n-1]}")
+    fi
+fi
 
 LOG_DIR="${SCRIPT_DIR}/logs"; mkdir -p "${LOG_DIR}"
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -77,6 +103,9 @@ for s in "${CKPTS[@]}"; do
 
     echo
     echo "===================== checkpoint-${s} ====================="
+    if [[ -f "${ck}/train_state.json" ]]; then
+        echo "[info] $(cat "${ck}/train_state.json")"
+    fi
 
     if [[ "${DRY_RUN}" == "1" ]]; then
         printf '[dry-run] bash run_a6_single_gpu.sh eval --dataset %q --cache %q --adapter %q --gpu %q --env-name %q --limit %q --eval-batch-size %q\n' \
