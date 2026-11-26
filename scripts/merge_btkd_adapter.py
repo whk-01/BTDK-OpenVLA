@@ -24,8 +24,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import sys
 from pathlib import Path
+
+# Allow running this file from any cwd (e.g. run_libero_sim.sh calls it by absolute path).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
