@@ -128,6 +128,36 @@ export PYTHONUNBUFFERED=1
 export MUJOCO_GL="${MUJOCO_GL_VALUE}"
 export PYOPENGL_PLATFORM="${MUJOCO_GL_VALUE}"
 export KMP_DUPLICATE_LIB_OK="${KMP_DUPLICATE_LIB_OK:-TRUE}"
+
+# robosuite 1.4.1 (the version LIBERO pins) compares ``model.jnt_type`` -- a plain int --
+# against members of ``mujoco.mjtJoint``.  Those members were IntEnum (int-comparable) up
+# to mujoco 2.3.x but became plain Enum in mujoco 3.0, so the comparison silently turns
+# False and robosuite dies with:
+#   AssertionError  robosuite/utils/binding_utils.py:... in get_joint_qpos_addr
+# LIBERO's own requirements pin mujoco==2.3.7; fail fast with the exact fix.
+if [[ "${BTKD_SKIP_MUJOCO_CHECK:-0}" != "1" && "${DRY_RUN}" != "1" ]]; then
+  MUJOCO_VER="$("${PYTHON_BIN}" - <<'PYVER' 2>/dev/null || true
+try:
+    import mujoco
+    print(mujoco.__version__)
+except Exception:
+    print("")
+PYVER
+)"
+  if [[ -z "${MUJOCO_VER}" ]]; then
+    echo "[warn] mujoco not importable in this env; LIBERO simulation will fail." >&2
+  elif [[ "${MUJOCO_VER%%.*}" -ge 3 ]]; then
+    echo "[FAIL] mujoco ${MUJOCO_VER} is incompatible with robosuite 1.4.1." >&2
+    echo "        mujoco 3.x turned mjtJoint/mjtObj into plain Enums, so robosuite's" >&2
+    echo "        get_joint_qpos_addr() raises AssertionError." >&2
+    echo "        Fix (LIBERO pins 2.3.7):" >&2
+    echo "          \"${PYTHON_BIN}\" -m pip install --no-cache-dir 'mujoco==2.3.7' 'numpy==1.26.4'" >&2
+    echo "        Skip this check with BTKD_SKIP_MUJOCO_CHECK=1 (not recommended)." >&2
+    exit 1
+  else
+    echo "[info] mujoco ${MUJOCO_VER} (ok for robosuite 1.4.1)"
+  fi
+fi
 # LIBERO's repo layout is nested (LIBERO/libero/libero).  `pip install -e .` from the
 # repo ROOT in setuptools "strict" editable mode maps only `libero.libero`, so
 # `import libero` fails with ModuleNotFoundError although pip reported success.

@@ -691,6 +691,49 @@ free -g; nproc
 > 而 `save_steps`/`eval_steps` 定期落盘的 `checkpoint-*` 和 `best/` 都在。
 > 让当前这一轮跑完，下一轮 `git pull` 后用新默认值即可。
 
+### 9.7 LIBERO 仿真：`get_joint_qpos_addr` 的 AssertionError
+
+```text
+File ".../robosuite/utils/binding_utils.py", line 521, in get_joint_qpos_addr
+    assert joint_type in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE)
+AssertionError
+```
+
+**不是代码问题，是 mujoco 版本不对。** `robosuite 1.4.1`（LIBERO 指定的版本）里
+`model.jnt_type[joint_id]` 是普通 `int`，而代码拿它和 `mujoco.mjtJoint` 的成员比较：
+
+- mujoco ≤ 2.3.x：`mjtJoint` 是 `IntEnum`，`3 == mjJNT_HINGE` 为 True → 正常；
+- mujoco 3.x：`mjtJoint` 变成了普通 `Enum`，`3 == mjJNT_HINGE` **恒为 False** →
+
+走到 `assert joint_type in (mjJNT_HINGE, mjJNT_SLIDE)` 必然失败。pip 解析
+`mujoco>=2.3.0`（robosuite 1.4.1 的宽松声明）时会装最新的 3.x，所以是"突然坏掉"。
+
+LIBERO 官方 pin 的是 **mujoco 2.3.7**：
+
+```bash
+conda activate whk_BTKD
+python -m pip show mujoco | head -2                       # 先看当前版本
+python -m pip install --no-cache-dir "mujoco==2.3.7" "numpy==1.26.4"
+python -c "import mujoco, robosuite, numpy; \
+           print('mujoco', mujoco.__version__); \
+           print('robosuite', robosuite.__version__); \
+           print('numpy', numpy.__version__)"
+# 期望：mujoco 2.3.7 / robosuite 1.4.1 / numpy 1.26.4
+```
+
+要点：
+
+- **不要** `pip install -U mujoco`，也不要让别的包顺带升级它；mujoco 2.3.7 的 wheel 自带引擎，
+  不需要另外下载二进制，也不需要重装 robosuite / LIBERO。
+- 同时把 `numpy` 钉在 `1.26.4`，否则 tensorflow 2.15 会报 `numpy.core.umath failed to import`
+  或 `numpy 2.x` 的 ABI 错误。
+- 装完不用重装 torch：mujoco 与 torch/CUDA 无关。
+- `scripts/run_libero_sim.sh` 现在会在启动前检查 mujoco 主版本，≥3 直接 FAIL 并打印上面这条命令；
+  确需跳过用 `BTKD_SKIP_MUJOCO_CHECK=1`。
+
+`mujoco 2.3.7` 的其他依赖（`absl-py`/`etils`/`glfw`/`pyopengl`）在装 3.x 时已经装过，
+所以降级不会引入新包；若 `import mujoco` 报缺依赖，去掉 `--no-cache-dir` 之外的限制直接重装一次即可。
+
 ---
 
 ## 10. 验证清单（已在 `BTKD` 环境实际执行）
