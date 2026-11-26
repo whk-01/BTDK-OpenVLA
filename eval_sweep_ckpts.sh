@@ -5,7 +5,7 @@
 #   bash eval_sweep_ckpts.sh                    # 默认 GPU=2，自动挑 4 个 checkpoint
 #   bash eval_sweep_ckpts.sh --gpu 1            # 换卡
 #   bash eval_sweep_ckpts.sh --limit 128        # 更快
-#   bash eval_sweep_ckpts.sh 500 1500 3000      # 只扫指定 update 号（=目录名后缀）
+#   bash eval_sweep_ckpts.sh 2000 8000 14000    # 只扫指定 step（=目录名后缀）
 #   bash eval_sweep_ckpts.sh --dry-run          # 只打印将执行的命令
 #
 # 关键点：run_a6_single_gpu.sh 内部会 `export CUDA_VISIBLE_DEVICES=<--gpu>`，
@@ -57,7 +57,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 # 不指定时自动发现已保存的 checkpoint-<update>，最多挑 4 个（均匀取样）。
-# 注意：目录名后缀是 optimizer update 序号，不是 micro-batch step。
+# 目录名后缀就是 micro-batch step（checkpoint-8000 = 训了 8000 步）。
 if [[ ${#CKPTS[@]} -eq 0 ]]; then
     mapfile -t ALL_CKPTS < <(
         find "${EXP}" -mindepth 1 -maxdepth 1 -type d -name 'checkpoint-*' -printf '%f\n' 2>/dev/null \
@@ -65,7 +65,7 @@ if [[ ${#CKPTS[@]} -eq 0 ]]; then
     )
     if [[ ${#ALL_CKPTS[@]} -eq 0 ]]; then
         echo "[FAIL] ${EXP} 下没有 checkpoint-*；该次训练可能只存了 best/ 和 final/。" >&2
-        echo "       想有中间快照，训练时用小一点的 --save-steps（单位=optimizer update）。" >&2
+        echo "       想有中间快照，训练时用小一点的 --save-steps（单位=micro-batch step）。" >&2
         exit 1
     elif [[ ${#ALL_CKPTS[@]} -le 4 ]]; then
         CKPTS=("${ALL_CKPTS[@]}")

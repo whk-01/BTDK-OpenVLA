@@ -58,10 +58,10 @@ ADAPTER=""
 # 仅作为 --epochs 0 时的兜底；默认训练按 EPOCHS 计（见下方 schedule_args）
 MAX_STEPS=20000
 MAX_STEPS_SET=0
-SAVE_STEPS=500
+SAVE_STEPS=2000
 EPOCHS=2
 EPOCHS_SET=0
-EVAL_STEPS=500
+EVAL_STEPS=8000
 EVAL_LIMIT=512
 EASY_HOLD=0.4
 TEMPERATURE=2.0
@@ -107,9 +107,9 @@ usage() {
   --easy-hold-frac F      前 F 比例保持 easy 分支，再余弦降到 hard（默认 0.4）
   --temperature T         KD 温度（默认 2.0；4.0 = 论文原值，hard 分支权重更大）
   --learning-rate LR      学习率（默认 5e-4）
-  --save-steps N          每 N 个 optimizer update 存一个 checkpoint（默认 500；
-                          注意单位是 optimizer update，不是 micro-batch step）
-  --eval-steps N          每 N 个 optimizer update 做一次离线评估（默认 500；0=关闭）
+  --save-steps N          每 N 个 micro-batch step 存一个 checkpoint（默认 2000；
+                          目录名 checkpoint-<step>，如 checkpoint-8000）
+  --eval-steps N          每 N 个 micro-batch step 做一次离线评估（默认 8000；0=关闭）
   --eval-limit N          训练中评估用的样本数（默认 512）
   --frames-dir DIR        frames 目录（默认 <cache>_frames）
   --materialize-shards N  materialize 分片大小（默认 1000 行/片）

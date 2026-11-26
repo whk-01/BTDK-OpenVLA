@@ -331,7 +331,7 @@ python scripts/train_btkd_student.py --cache_dir caches/bridge_orig_teacher \
     --gradient_checkpointing --epochs 2 \
     --temperature 2.0 --easy_hold_frac 0.4 \
     --lr_schedule cosine --lr_warmup_frac 0.03 \
-    --save_steps 2000 --eval_steps 2000 --eval_limit 512
+    --save_steps 2000 --eval_steps 8000 --eval_limit 512
 
 # step 4: offline validation of a trained adapter against the cached teacher
 # (one 7B model; 512 rows by default, no simulator needed)

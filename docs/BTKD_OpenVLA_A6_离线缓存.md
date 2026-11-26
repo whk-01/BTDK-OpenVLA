@@ -390,12 +390,13 @@ python scripts/train_btkd_student.py \
     --epochs 2 \
     --learning_rate 5e-4 --lr_schedule cosine --lr_warmup_frac 0.03 \
     --temperature 2.0 --lambda_stu 0.5 --easy_hold_frac 0.4 \
-    --save_steps 2000 --eval_steps 2000 --eval_limit 512 \
+    --save_steps 2000 --eval_steps 8000 --eval_limit 512 \
     --run_root_dir runs_btkd
 ```
 
-`--save_steps` / `--eval_steps` 现在都按 **optimizer update** 计（不是 micro-batch）。
-`checkpoint-<N>` 里的 N 也是 update 序号。
+`--save_steps` / `--eval_steps` 都按 **micro-batch step** 计（不是 optimizer update）。
+`checkpoint-<N>` 里的 N 就是「训了 N 步」，例如 `checkpoint-8000` = 第 8000 个 micro-batch。
+每个 checkpoint 里还会写一个 `train_state.json`（`{"step": 8000, "update": 500}`），两者可互相换算。
 
 手动跑（QLoRA 版，装得上 `bitsandbytes` 时）：
 
@@ -462,7 +463,7 @@ runs_btkd/<exp>/
 ├── train_config.json    # 解析后的总步数/epoch/exp 名，出问题先看它
 ├── metrics.jsonl        # 每 log_steps 一行 train 记录 + 每次 eval 一行
 ├── best/               # 训练中评估最好的 adapter  ← 优先用这个
-├── checkpoint-2000/    # 每 --save_steps 个 update 一份
+├── checkpoint-2000/    # 每 --save_steps 个 micro-batch step 一份
 ├── checkpoint-4000/
 └── final/              # 最后一刻的权重
 ```
@@ -524,8 +525,8 @@ python scripts/eval_btkd_student.py \
 | `--frame_shuffle` | `shard`（脚本默认） | `shard`：先打乱分片顺序、再打乱分片内行序（每个分片一个 epoch 只 `torch.load` 一次）；`global`：全表 `randperm`，bs=1 时几乎每步都要换分片 |
 | `--frame_cache_shards` | 8（脚本默认） | 同时 mmap 的 frames 分片数；`0` = 全部常驻（mmap 只占虚拟地址空间） |
 | `--profile_steps` | 0 | 前 N 个 micro-batch 做 CUDA 同步，日志里打印 `data/fwd/bwd` 耗时拆分，用来判断瓶颈 |
-| `--save_steps` | 2000 | 每 N 次 **optimizer update** 存 `checkpoint-N` |
-| `--eval_steps` | 0（脚本传 2000） | 每 N 次 update 做一次离线评估，最好的存 `best/`；0 = 关闭 |
+| `--save_steps` | 2000 | 每 N 个 **micro-batch step** 存 `checkpoint-N`（N 就是步数） |
+| `--eval_steps` | 0（脚本传 8000） | 每 N 个 step 做一次离线评估，最好的存 `best/`；0 = 关闭 |
 | `--eval_limit` | 512 | 训练中评估的样本数（越大越准越慢） |
 | `--gradient_checkpointing` | 关（脚本默认开） | 用算力换显存，24 GB 上必须开 |
 | `--temperature` | 2.0（脚本）/ 4.0（论文） | KD 温度。**OpenVLA 的 logits 尺度与 ResNet 不同**，如果发现 `kd` 比 `ce` 小两个数量级，先试 2.0；反之试 6.0 |
@@ -687,7 +688,7 @@ free -g; nproc
 `data` 远大于 `fwd+bwd` 就是数据管线的问题（分片/磁盘/Python）；三者都很大才是算力不够。
 
 > 已经跑到一半的进程**不要 kill**：训练脚本没有 resume，重启等于从头再来；
-> 而 `save_steps`/`eval_steps` 每 2000 次 update 落盘的 `checkpoint-*` 和 `best/` 都在。
+> 而 `save_steps`/`eval_steps` 定期落盘的 `checkpoint-*` 和 `best/` 都在。
 > 让当前这一轮跑完，下一轮 `git pull` 后用新默认值即可。
 
 ---

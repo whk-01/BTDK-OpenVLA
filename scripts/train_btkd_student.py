@@ -80,7 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--learning_rate", type=float, default=5e-4)
     p.add_argument("--epochs", type=float, default=0.0, help="number of dataset epochs (0 = use --max_steps)")
     p.add_argument("--max_steps", type=int, default=20_000, help="micro-batches; only used when --epochs 0")
-    p.add_argument("--save_steps", type=int, default=2_000, help="optimizer updates between checkpoints")
+    p.add_argument("--save_steps", type=int, default=2_000,
+                   help="micro-batch steps between checkpoints (dir is checkpoint-<step>)")
     p.add_argument("--log_steps", type=int, default=20)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--lr_schedule", default="cosine", choices=["cosine", "constant"])
@@ -134,7 +135,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=-1, help="only use the first N cached samples")
 
     # in-training evaluation (frames path only)
-    p.add_argument("--eval_steps", type=int, default=0, help="evaluate every N optimizer updates (0 = off)")
+    p.add_argument("--eval_steps", type=int, default=0,
+                   help="evaluate every N micro-batch steps (0 = off)")
     p.add_argument("--eval_limit", type=int, default=512)
     p.add_argument("--eval_batch_size", type=int, default=1,
                    help="in-training eval batch (1 is safest together with a resident 7B)")
@@ -764,7 +766,8 @@ def main() -> None:
                 wandb.log(record)
 
         # ---- in-training evaluation (frames path only) ---------------------------
-        if args.eval_steps > 0 and did_update and n_updates % args.eval_steps == 0:
+        n_steps_done = step + 1
+        if args.eval_steps > 0 and n_steps_done % args.eval_steps == 0:
             if store is None:
                 print("[eval] skipped: in-training eval needs a materialised frame store", flush=True)
             else:
@@ -786,43 +789,43 @@ def main() -> None:
                 acc = metrics["student_token_acc"]
                 mean6 = sum(metrics["per_dim_acc"][:6]) / 6.0
                 print(
-                    f"[eval @ update {n_updates} (step {step})] student={acc:.4f} dim0-5={mean6:.4f} "
+                    f"[eval @ step {n_steps_done} (update {n_updates})] student={acc:.4f} dim0-5={mean6:.4f} "
                     f"teacher={metrics['teacher_token_acc']:.4f} "
                     f"agreement={metrics['student_teacher_agreement']:.4f} "
                     f"({time.time() - t0:.0f}s, {args.eval_limit} rows)",
                     flush=True,
                 )
                 with metrics_path.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps({"type": "eval", "step": step, "update": n_updates, **metrics}) + "\n")
+                    fh.write(json.dumps({"type": "eval", "step": n_steps_done, "update": n_updates, **metrics}) + "\n")
                 if wandb is not None:
-                    wandb.log({"eval_step": step, "eval_update": n_updates, **{f"eval_{k}": v for k, v in metrics.items()
+                    wandb.log({"eval_step": n_steps_done, "eval_update": n_updates, **{f"eval_{k}": v for k, v in metrics.items()
                                                      if isinstance(v, (int, float))}})
                 if acc > best_acc:
                     best_acc = acc
-                    best_step = step
+                    best_step = n_steps_done
                     model.save_pretrained(run_dir / "best")
                     (run_dir / "best" / "train_state.json").write_text(
-                        json.dumps({"update": n_updates, "step": step, "eval_acc": acc})
+                        json.dumps({"step": n_steps_done, "update": n_updates, "eval_acc": acc})
                         + "\n",
                         encoding="utf-8",
                     )
                     print(
                         f"[eval] new best -> {run_dir / 'best'} "
-                        f"(update {n_updates}, step {step}, acc {acc:.4f})",
+                        f"(step {n_steps_done}, update {n_updates}, acc {acc:.4f})",
                         flush=True,
                     )
                 model.train()
 
-        if args.save_steps > 0 and did_update and n_updates % args.save_steps == 0:
-            # NOTE: the suffix is the OPTIMIZER UPDATE index, not the micro-batch step.
-            ckpt = run_dir / f"checkpoint-{n_updates}"
+        if args.save_steps > 0 and n_steps_done % args.save_steps == 0:
+            # NOTE: the suffix is the micro-batch STEP (samples consumed / batch_size).
+            ckpt = run_dir / f"checkpoint-{n_steps_done}"
             model.save_pretrained(ckpt)
             (ckpt / "train_state.json").write_text(
-                json.dumps({"update": n_updates, "step": step}) + "\n", encoding="utf-8"
+                json.dumps({"step": n_steps_done, "update": n_updates}) + "\n",
+                encoding="utf-8",
             )
             print(
-                f"[save] {ckpt} (update {n_updates}, micro-step {step}; "
-                f"dir name uses the update index)",
+                f"[save] {ckpt} (step {n_steps_done}, update {n_updates})",
                 flush=True,
             )
 
