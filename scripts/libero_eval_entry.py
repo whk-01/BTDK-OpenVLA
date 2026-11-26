@@ -19,50 +19,89 @@ from __future__ import annotations
 import os
 import runpy
 import sys
-import types
+import tempfile
 from pathlib import Path
 
 
-class _NoOp:
-    """Absorbs any attribute access/call so ``wandb.xxx(...)`` becomes a no-op."""
+_WANDB_STUB_SRC = '''"""No-op stand-in for Weights & Biases (BTKD offline LIBERO evaluation)."""
 
-    def __init__(self, name: str = "wandb") -> None:
+__version__ = "0.0.0"
+__all__ = ["init", "log", "save", "finish", "watch"]
+
+
+class _NoOp:
+    """Absorbs any attribute access or call so ``wandb.xxx(...)`` does nothing."""
+
+    def __init__(self, name="wandb"):
         self._name = name
 
-    def __call__(self, *args, **kwargs) -> "_NoOp":
+    def __call__(self, *args, **kwargs):
         return self
 
-    def __getattr__(self, item: str) -> "_NoOp":
-        return _NoOp(f"{self._name}.{item}")
+    def __getattr__(self, item):
+        return _NoOp(self._name + "." + item)
 
     def __iter__(self):
         return iter(())
 
-    def __bool__(self) -> bool:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
         return False
 
-    def __repr__(self) -> str:
-        return f"<no-op {self._name}>"
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return "<no-op %s>" % self._name
+
+
+def __getattr__(name):  # PEP 562: any unknown attribute becomes a no-op
+    return _NoOp("wandb." + name)
+
+
+def init(*args, **kwargs):
+    return None
+
+
+def log(*args, **kwargs):
+    return None
+
+
+def save(*args, **kwargs):
+    return None
+
+
+def finish(*args, **kwargs):
+    return None
+'''
 
 
 def install_wandb_stub() -> None:
     """Make ``import wandb`` work without Weights & Biases.
 
-    W&B is only used inside ``if cfg.use_wandb:`` blocks, so a stub loses nothing for
-    offline evaluation.  Set ``BTKD_USE_WANDB=1`` to use the real library instead.
+    The upstream evaluator imports wandb unconditionally but only uses it inside
+    ``if cfg.use_wandb:`` blocks (default False).  A real module on disk is used as the
+    stub so that ``__file__``/``__spec__`` exist -- tooling such as ``inspect.getfile``
+    raises ``TypeError: ... is a built-in module`` for a bare ``ModuleType``.
+
+    Set ``BTKD_USE_WANDB=1`` to keep the real library instead.
     """
     if os.environ.get("BTKD_USE_WANDB", "0") == "1":
+        print("[libero_eval_entry] BTKD_USE_WANDB=1 -> using the real wandb library")
         return
-    try:
-        import wandb  # noqa: F401
-        note = "real wandb found but disabled (BTKD_USE_WANDB=0)"
-    except Exception:
-        note = "wandb not installed"
-    module = types.ModuleType("wandb")
-    module.__getattr__ = lambda name: _NoOp(f"wandb.{name}")  # PEP 562
-    module.__all__ = []
-    sys.modules["wandb"] = module
-    print(f"[libero_eval_entry] {note} -> using a no-op stub; metrics go to the local EVAL log")
+    if "wandb" in sys.modules:
+        return
+
+    stub_dir = Path(tempfile.mkdtemp(prefix="btkd_wandb_stub_"))
+    pkg = stub_dir / "wandb"
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / "__init__.py").write_text(_WANDB_STUB_SRC, encoding="utf-8")
+    sys.path.insert(0, str(stub_dir))
+    import wandb  # noqa: F401  (resolves to the stub because stub_dir comes first)
+
+    print(f"[libero_eval_entry] wandb disabled (BTKD_USE_WANDB=0) -> no-op stub at {pkg}")
 
 
 def main() -> None:
