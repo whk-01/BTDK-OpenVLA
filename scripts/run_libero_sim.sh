@@ -157,6 +157,48 @@ fi
 if [[ -n "${LIBERO_PATH}" ]]; then
   export PYTHONPATH="${LIBERO_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
   echo "[info] LIBERO source: ${LIBERO_PATH} (prepended to PYTHONPATH)"
+  LIBERO_BENCH_ROOT="${LIBERO_PATH}/libero/libero"
+else
+  # Installed package (editable or not): ask importlib where libero/libero/__init__.py is.
+  # find_spec does not execute libero/libero/__init__.py, so no interactive config prompt.
+  LIBERO_BENCH_ROOT="$("${PYTHON_BIN}" -c '
+import os
+try:
+    import importlib.util
+    spec = importlib.util.find_spec("libero.libero")
+    print(os.path.dirname(os.path.abspath(spec.origin)) if spec and spec.origin else "")
+except Exception:
+    print("")
+' 2>/dev/null || true)"
+fi
+
+# ~/.libero/config.yaml is global to the user and is created once by whichever LIBERO
+# install imported first -- possibly another conda env (e.g. whk_smolvla).  Its
+# bddl_files/init_files then point at a path that does not exist here, and the run dies
+# with FileNotFoundError on "*.pruned_init".  Pin a BTKD-local config instead.
+if [[ -n "${LIBERO_BENCH_ROOT}" && -z "${LIBERO_CONFIG_PATH:-}" ]]; then
+  export LIBERO_CONFIG_PATH="${ROOT}/.libero"
+  mkdir -p "${LIBERO_CONFIG_PATH}"
+  if [[ "${DRY_RUN}" != "1" ]]; then
+    "${PYTHON_BIN}" - "${LIBERO_BENCH_ROOT}" "${LIBERO_CONFIG_PATH}/config.yaml" <<'PYCFG'
+import json, pathlib, sys
+
+root, out = sys.argv[1], sys.argv[2]
+cfg = {
+    "benchmark_root": root,
+    "bddl_files": f"{root}/bddl_files",
+    "init_states": f"{root}/init_files",
+    "datasets": f"{root}/../datasets",
+    "assets": f"{root}/assets",
+}
+# JSON is a subset of YAML, so LIBERO's yaml.load() reads this fine and we do not
+# depend on PyYAML being importable by whichever python is used.
+pathlib.Path(out).write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+missing = [k for k, v in cfg.items() if not pathlib.Path(v).exists() and k != "datasets"]
+extra = f" (MISSING: {', '.join(missing)})" if missing else ""
+print(f"[info] LIBERO config: {out}{extra}")
+PYCFG
+  fi
 fi
 
 if [[ "${DRY_RUN}" != "1" ]]; then
