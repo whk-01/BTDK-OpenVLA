@@ -128,14 +128,41 @@ export PYTHONUNBUFFERED=1
 export MUJOCO_GL="${MUJOCO_GL_VALUE}"
 export PYOPENGL_PLATFORM="${MUJOCO_GL_VALUE}"
 export KMP_DUPLICATE_LIB_OK="${KMP_DUPLICATE_LIB_OK:-TRUE}"
+# LIBERO's repo layout is nested (LIBERO/libero/libero).  `pip install -e .` from the
+# repo ROOT in setuptools "strict" editable mode maps only `libero.libero`, so
+# `import libero` fails with ModuleNotFoundError although pip reported success.
+# Putting the repo ROOT on PYTHONPATH makes `libero` resolve as a namespace package.
+libero_importable() {
+  "${PYTHON_BIN}" -c 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec("libero") else 1)' >/dev/null 2>&1
+}
+
+if [[ -n "${LIBERO_PATH}" ]]; then
+  if [[ -f "${LIBERO_PATH}/libero/libero/__init__.py" ]]; then
+    :  # already the repo root
+  elif [[ -f "${LIBERO_PATH}/libero/__init__.py" ]]; then
+    # caller passed .../LIBERO/libero; the importable root is its parent
+    LIBERO_PATH="$(cd "${LIBERO_PATH}/.." && pwd)"
+  fi
+fi
+
+if [[ -z "${LIBERO_PATH}" ]] && ! libero_importable; then
+  for cand in "${ROOT}/LIBERO" "$(dirname "${ROOT}")/LIBERO" "${HOME}/LIBERO"; do
+    if [[ -f "${cand}/libero/libero/__init__.py" ]]; then
+      LIBERO_PATH="${cand}"
+      break
+    fi
+  done
+fi
+
 if [[ -n "${LIBERO_PATH}" ]]; then
   export PYTHONPATH="${LIBERO_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
+  echo "[info] LIBERO source: ${LIBERO_PATH} (prepended to PYTHONPATH)"
 fi
 
 if [[ "${DRY_RUN}" != "1" ]]; then
   "${PYTHON_BIN}" - <<'PY'
 import importlib.util
-mods = ["torch", "transformers", "peft", "tensorflow", "libero", "robosuite", "bddl", "imageio"]
+mods = ["torch", "transformers", "peft", "tensorflow", "libero", "libero.libero", "robosuite", "bddl", "imageio"]
 missing = [m for m in mods if importlib.util.find_spec(m) is None]
 if missing:
     raise SystemExit(
@@ -143,8 +170,11 @@ if missing:
         "One-time LIBERO setup in the BTKD env:\n"
         "  pip install 'robosuite==1.4.1' bddl easydict cloudpickle gym 'imageio[ffmpeg]'\n"
         "  git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git\n"
-        "  pip install --no-deps -e ./LIBERO\n"
-        "Then rerun with --libero-path /absolute/path/to/LIBERO if it is not importable."
+        "  cd LIBERO && pip install --no-deps -e . --config-settings editable_mode=compat\n"
+        "NOTE: the default 'strict' editable mode is broken for LIBERO's nested layout\n"
+        "      (pip says OK, but `import libero` raises ModuleNotFoundError).\n"
+        "Fallback without reinstalling: rerun with --libero-path /absolute/path/to/LIBERO\n"
+        "      (the repo ROOT that contains the libero/ directory, not libero/libero)."
     )
 PY
 fi
