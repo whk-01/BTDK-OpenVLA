@@ -15,6 +15,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INVOKE_PWD="$(pwd)"
 OPENVLA_DIR="${ROOT}/openvla"
 
 ENV_NAME="${BTKD_ENV_NAME:-whk_BTKD}"
@@ -90,6 +91,32 @@ while [[ $# -gt 0 ]]; do
     *)               echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+# The evaluator is launched after ``cd openvla/``, so a relative --merged/--adapter/
+# --checkpoint would be resolved against openvla/ and Transformers would treat it as a
+# Hub repo id ("... is not a local folder").  Anchor all paths to the invocation dir.
+abs_path() {
+  local p="$1"
+  [[ -z "${p}" ]] && { printf '%s' ""; return; }
+  case "${p}" in
+    "~/"*) p="${HOME}/${p#\~/}" ;;
+  esac
+  if [[ "${p}" = /* ]]; then printf '%s' "${p}"; else printf '%s/%s' "${INVOKE_PWD}" "${p}"; fi
+}
+# Same, but leave untouched when the path does not exist here -- it may be an HF repo id
+# such as openvla/openvla-7b-finetuned-libero-spatial.
+abs_path_if_exists() {
+  local p="$1"
+  [[ -z "${p}" ]] && { printf '%s' ""; return; }
+  if [[ "${p}" = /* ]]; then printf '%s' "${p}"; return; fi
+  if [[ -e "${INVOKE_PWD}/${p}" ]]; then printf '%s/%s' "${INVOKE_PWD}" "${p}"; else printf '%s' "${p}"; fi
+}
+
+ADAPTER="$(abs_path "${ADAPTER}")"
+MERGED="$(abs_path "${MERGED}")"
+LIBERO_PATH="$(abs_path "${LIBERO_PATH}")"
+BASE="$(abs_path_if_exists "${BASE}")"
+CHECKPOINT="$(abs_path_if_exists "${CHECKPOINT}")"
 
 if [[ ! -f "${OPENVLA_DIR}/experiments/robot/libero/run_libero_eval.py" ]]; then
   echo "[FAIL] OpenVLA source not found: ${OPENVLA_DIR}" >&2

@@ -292,12 +292,32 @@ def print_verdict() -> None:
     print("=" * 78 + "\n", flush=True)
 
 
+def _fix_relative_checkpoint(root: Path) -> None:
+    """Resolve a relative --pretrained_checkpoint against the repo root.
+
+    ``run_libero_sim.sh`` starts this file after ``cd openvla/``, so a checkpoint such as
+    ``merged/btkd_spatial_final`` no longer resolves and Transformers reports
+    "is not a local folder and is not a valid model identifier".
+    """
+    for i, tok in enumerate(sys.argv[:-1]):
+        if tok != "--pretrained_checkpoint":
+            continue
+        val = sys.argv[i + 1]
+        if not val or os.path.isabs(val) or os.path.exists(val):
+            continue
+        candidate = root / val
+        if candidate.exists():
+            sys.argv[i + 1] = str(candidate)
+            print(f"[libero_eval_entry] resolved --pretrained_checkpoint -> {candidate}", flush=True)
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     openvla = root / "openvla"
     if not (openvla / "experiments/robot/libero/run_libero_eval.py").is_file():
         raise SystemExit(f"OpenVLA source not found under {openvla}")
 
+    _fix_relative_checkpoint(root)
     os.chdir(openvla)
     sys.path.insert(0, str(openvla))
     install_wandb_stub()
