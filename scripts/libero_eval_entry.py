@@ -104,6 +104,58 @@ def install_wandb_stub() -> None:
     print(f"[libero_eval_entry] wandb disabled (BTKD_USE_WANDB=0) -> no-op stub at {pkg}")
 
 
+def install_action_debug() -> None:
+    """BTKD_DEBUG_ACTIONS=1 -> print the first actions the policy emits, plus its stats.
+
+    A frozen arm in LIBERO has two very different causes and this print separates them:
+
+    * ``action`` is identical (or ~0) every step  -> the policy itself is degenerate
+      (merged weights broken, or the student only learned the marginal action mode);
+    * ``action`` changes but the arm does not move -> the simulator/harness is at fault
+      (wrong unnorm_key, clipped actions, bad camera input).
+    """
+    if os.environ.get("BTKD_DEBUG_ACTIONS", "0") != "1":
+        return
+
+    import numpy as np
+
+    from experiments.robot import robot_utils
+
+    original = robot_utils.get_action
+    n_dump = int(os.environ.get("BTKD_DEBUG_ACTIONS_N", "25"))
+    seen = {"i": 0}
+
+    def wrapped(cfg, model, obs, task_label, processor=None):
+        action = original(cfg, model, obs, task_label, processor=processor)
+        i = seen["i"]
+        seen["i"] += 1
+        if i < n_dump:
+            print(
+                f"[act {i:03d}] action={np.round(action, 4).tolist()} "
+                f"eef={np.round(obs['state'][:3], 4).tolist()}",
+                flush=True,
+            )
+            if i == 0:
+                print(f"[act] checkpoint={cfg.pretrained_checkpoint}", flush=True)
+                print(f"[act] unnorm_key={cfg.unnorm_key} center_crop={cfg.center_crop}", flush=True)
+                try:
+                    stats = model.get_action_stats(cfg.unnorm_key)
+                    q01 = np.round(stats["q01"], 4).tolist()
+                    q99 = np.round(stats["q99"], 4).tolist()
+                    print(f"[act] q01={q01}", flush=True)
+                    print(f"[act] q99={q99}", flush=True)
+                    print(
+                        "[act] q99-q01=" + str([round(b - a, 4) for a, b in zip(q01, q99)]),
+                        flush=True,
+                    )
+                except Exception as exc:  # stats are only used for debugging
+                    print(f"[act] could not read norm stats: {exc}", flush=True)
+        return action
+
+    robot_utils.get_action = wrapped
+    print(f"[libero_eval_entry] action debug on: dumping the first {n_dump} actions")
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     openvla = root / "openvla"
@@ -113,6 +165,7 @@ def main() -> None:
     os.chdir(openvla)
     sys.path.insert(0, str(openvla))
     install_wandb_stub()
+    install_action_debug()
 
     from transformers import AutoModelForVision2Seq
 

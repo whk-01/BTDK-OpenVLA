@@ -734,6 +734,70 @@ python -c "import mujoco, robosuite, numpy; \
 `mujoco 2.3.7` 的其他依赖（`absl-py`/`etils`/`glfw`/`pyopengl`）在装 3.x 时已经装过，
 所以降级不会引入新包；若 `import mujoco` 报缺依赖，去掉 `--no-cache-dir` 之外的限制直接重装一次即可。
 
+### 9.8 LIBERO 里机械臂完全不动
+
+按顺序做 3 个检查，10 分钟内能定位。
+
+**检查 1：merged 权重是不是好的（不用仿真，GPU 上 3–5 分钟）**
+
+```bash
+python scripts/eval_btkd_student.py \
+  --cache_dir caches/libero_spatial_teacher \
+  --dataset_name libero_spatial_no_noops --limit 512 --device cuda:0 \
+  --merged_path merged/btkd_spatial_best
+```
+
+- 分数 ≈ adapter 自己的 0.48 → 合并没问题，问题在评测侧（检查 2/3）；
+- 分数掉到 ~0.0x → LoRA 没合进去 / 合到了别的 base，用 `--rebuild-merge` 重做。
+
+**检查 2：看模型到底吐了什么动作（最直接）**
+
+```bash
+BTKD_DEBUG_ACTIONS=1 bash scripts/run_libero_sim.sh \
+  --adapter ".../best" --libero-path /media/.../whk/LIBERO \
+  --suite libero_spatial --trials 1 --gpu 3 --note btkd_debug 2>&1 | tee logs/btkd_debug.out
+```
+
+日志里会多出：
+
+```text
+[act 000] action=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0] eef=[...]
+[act] checkpoint=merged/btkd_spatial_best
+[act] unnorm_key=libero_spatial center_crop=False
+[act] q01=[...] / q99=[...] / q99-q01=[...]
+```
+
+判读：
+
+| 现象 | 原因 |
+|---|---|
+| 25 步 action 几乎逐位相同、且 xyz≈0 | 策略退化成"输出众数"，学生只学到了边缘分布 → 回训练侧解决（见第 6 节超参） |
+| action 每步都变，但 `eef` 不动 | 仿真侧问题：`unnorm_key`/stats 不对，或动作被裁没了 |
+| `q99-q01` 里前三维 ≈ 0 | un-norm 统计选错了 key（见检查 3） |
+| 报 `Action un-norm key ... not found` | merged 目录的 `config.json` 没带 libero 统计，重跑 merge |
+
+**检查 3：确认 un-norm 用的是哪套统计**
+
+```bash
+python - <<'PY'
+import json
+c = json.load(open("merged/btkd_spatial_best/config.json"))
+ns = c.get("norm_stats") or {}
+print("available keys:", list(ns))
+for k in ("libero_spatial", "libero_spatial_no_noops"):
+    if k in ns:
+        a = ns[k]["action"]
+        print(k, "q01", [round(x, 3) for x in a["q01"]])
+        print(k, "q99", [round(x, 3) for x in a["q99"]])
+PY
+```
+
+评测脚本按 `task_suite_name` 取 key，**优先 `libero_spatial`**，只有它不存在时才退回
+`libero_spatial_no_noops`。学生是在 `libero_spatial_no_noops` 上蒸馏的；如果两个 key 都在，
+而 `libero_spatial` 来自别的来源（例如 base 模型的 config），就会用错统计 → 动作被缩放到接近 0。
+这种情况下把 merged 目录 `config.json` 的 `norm_stats` 只保留 `libero_spatial_no_noops`
+（或把该 key 复制一份改名为 `libero_spatial`）再评。
+
 ---
 
 ## 10. 验证清单（已在 `BTKD` 环境实际执行）

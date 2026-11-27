@@ -59,6 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--cache_dir", required=True, help="teacher-logit cache used for training")
     p.add_argument("--adapter_path", default="", help="LoRA adapter dir (final/ or checkpoint-XXXX); empty = base model")
+    p.add_argument(
+        "--merged_path",
+        default="",
+        help="complete merged HF checkpoint (e.g. merged/btkd_spatial_best); takes precedence over --adapter_path",
+    )
     p.add_argument("--vla_path", default="openvla/openvla-7b", help="base OpenVLA checkpoint")
     p.add_argument("--data_root_dir", default="datasets/open-x-embodiment")
     p.add_argument("--dataset_name", required=True)
@@ -168,6 +173,16 @@ def main() -> None:
     n_eval = len(cache) if args.limit < 0 else min(args.limit, len(cache))
     if n_eval <= 0:
         raise SystemExit("nothing to evaluate")
+
+    if args.merged_path:
+        # A merged checkpoint is a full HF model (base + LoRA already folded in).  Evaluating it
+        # here answers "did the LoRA merge survive?" without touching the simulator: the score
+        # should match the adapter's own token accuracy to within bf16 noise.
+        if not (Path(args.merged_path) / "config.json").is_file():
+            raise SystemExit(f"{args.merged_path} has no config.json; not a full checkpoint")
+        print(f"[eval] merged checkpoint={args.merged_path} (adapter loading skipped)")
+        args.vla_path = args.merged_path
+        args.adapter_path = ""
 
     adapter_dir = None
     if args.adapter_path:
@@ -286,7 +301,7 @@ def main() -> None:
         "student_token_acc_hard": (hard_correct / hard_total) if hard_total else 0.0,
         "easy_frac": (easy_total / n_tokens) if n_tokens else 0.0,
         "per_dim_acc": [round(dim_correct[d].item() / max(1, dim_total[d].item()), 4) for d in range(spec.n_dims)],
-        "adapter": args.adapter_path or None,
+        "adapter": args.merged_path or args.adapter_path or None,
         "cache_dir": os.path.abspath(args.cache_dir),
         "dataset": args.dataset_name,
     }
