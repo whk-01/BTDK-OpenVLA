@@ -736,9 +736,45 @@ python -c "import mujoco, robosuite, numpy; \
 
 ### 9.8 LIBERO 里机械臂完全不动
 
-按顺序做 3 个检查，10 分钟内能定位。
+一条命令定性：跑 30 步策略，打印动作/末端位移/生成 token，最后给出结论。
 
-**检查 1：merged 权重是不是好的（不用仿真，GPU 上 3–5 分钟）**
+```bash
+bash scripts/run_libero_sim.sh --diagnose 30 \
+  --adapter "runs_btkd/<exp>/best" \
+  --libero-path /media/.../whk/LIBERO --suite libero_spatial --gpu 3 --note btkd_diag \
+  2>&1 | tee logs/btkd_diag.out
+```
+
+它等价于 `BTKD_DEBUG_ACTIONS=1 BTKD_DEBUG_STEPS=30`，会在第 31 次策略调用时提前结束
+（约 2 分钟，含加载模型），末尾打印：
+
+```text
+================ BTKD policy diagnosis ================
+checkpoint : merged/btkd_spatial_best
+unnorm_key : libero_spatial   center_crop=False
+q01        : [-0.745, -0.662, -0.938, -0.107, -0.207, -0.184, 0.0]
+q99        : [...]
+q99-q01    : [...]
+steps      : 30
+mean |a|   : [...]
+std(a)     : [...]
+distinct   : 1/30 distinct action vectors
+eef move   : net 0.0000 m, path 0.0000 m
+tokens     : 30 steps, first=[31885, 31890, ...]
+out-of-space action tokens: 0.0%  (valid range 31744..32000)
+[VERDICT] ...
+```
+
+自动判读规则（`scripts/libero_eval_entry.py::print_verdict`）：
+
+| VERDICT | 含义 | 处置 |
+|---|---|---|
+| `生成了动作词表之外的 token` | 模型输出乱码，token 被 clip 成极端 bin | merge 坏了或训练崩了：先跑下面的离线检查，再 `--rebuild-merge` |
+| `动作恒定且 ≈ 0` | 策略退化成"输出众数"，学生只学到边缘分布 | 训练侧：`--temperature 1.0`、`--lambda_stu 0.7`、`--epochs 2`；先试 `final/` |
+| `动作幅度正常但末端几乎没动` | 仿真侧没执行动作 | 查 `unnorm_key` / `dataset_statistics.json` / `--center-crop` |
+| `策略在动` | 不是 bug | 跑完整 `--trials 50` 看真实成功率 |
+
+**配套的离线检查（不用仿真，GPU 上 3–5 分钟）**：确认 merged 权重有没有被合并坏。
 
 ```bash
 python scripts/eval_btkd_student.py \
@@ -747,56 +783,12 @@ python scripts/eval_btkd_student.py \
   --merged_path merged/btkd_spatial_best
 ```
 
-- 分数 ≈ adapter 自己的 0.48 → 合并没问题，问题在评测侧（检查 2/3）；
-- 分数掉到 ~0.0x → LoRA 没合进去 / 合到了别的 base，用 `--rebuild-merge` 重做。
+分数 ≈ adapter 自己的 0.48 → 合并正常；掉到 ~0.0x → LoRA 没合进去。
 
-**检查 2：看模型到底吐了什么动作（最直接）**
-
-```bash
-BTKD_DEBUG_ACTIONS=1 bash scripts/run_libero_sim.sh \
-  --adapter ".../best" --libero-path /media/.../whk/LIBERO \
-  --suite libero_spatial --trials 1 --gpu 3 --note btkd_debug 2>&1 | tee logs/btkd_debug.out
-```
-
-日志里会多出：
-
-```text
-[act 000] action=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0] eef=[...]
-[act] checkpoint=merged/btkd_spatial_best
-[act] unnorm_key=libero_spatial center_crop=False
-[act] q01=[...] / q99=[...] / q99-q01=[...]
-```
-
-判读：
-
-| 现象 | 原因 |
-|---|---|
-| 25 步 action 几乎逐位相同、且 xyz≈0 | 策略退化成"输出众数"，学生只学到了边缘分布 → 回训练侧解决（见第 6 节超参） |
-| action 每步都变，但 `eef` 不动 | 仿真侧问题：`unnorm_key`/stats 不对，或动作被裁没了 |
-| `q99-q01` 里前三维 ≈ 0 | un-norm 统计选错了 key（见检查 3） |
-| 报 `Action un-norm key ... not found` | merged 目录的 `config.json` 没带 libero 统计，重跑 merge |
-
-**检查 3：确认 un-norm 用的是哪套统计**
-
-```bash
-python - <<'PY'
-import json
-c = json.load(open("merged/btkd_spatial_best/config.json"))
-ns = c.get("norm_stats") or {}
-print("available keys:", list(ns))
-for k in ("libero_spatial", "libero_spatial_no_noops"):
-    if k in ns:
-        a = ns[k]["action"]
-        print(k, "q01", [round(x, 3) for x in a["q01"]])
-        print(k, "q99", [round(x, 3) for x in a["q99"]])
-PY
-```
-
-评测脚本按 `task_suite_name` 取 key，**优先 `libero_spatial`**，只有它不存在时才退回
-`libero_spatial_no_noops`。学生是在 `libero_spatial_no_noops` 上蒸馏的；如果两个 key 都在，
-而 `libero_spatial` 来自别的来源（例如 base 模型的 config），就会用错统计 → 动作被缩放到接近 0。
-这种情况下把 merged 目录 `config.json` 的 `norm_stats` 只保留 `libero_spatial_no_noops`
-（或把该 key 复制一份改名为 `libero_spatial`）再评。
+**关于 `merged/*/config.json` 里的 `norm_stats`**：里面只有 OXE 数据集（`bridge_orig`、
+`fractal20220817_data` …），**这是正常的**。`openvla_utils.get_vla()` 会在加载后用
+`<ckpt>/dataset_statistics.json` 覆盖 `vla.norm_stats`，真正生效的是那份文件
+（`keys: ['libero_spatial']`，7 维，range 约 1.0–1.9）。不要按 config.json 去判断。
 
 ---
 

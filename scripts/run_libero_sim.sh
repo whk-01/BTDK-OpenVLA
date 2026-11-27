@@ -34,6 +34,7 @@ MUJOCO_GL_VALUE="egl"
 PYTHON_BIN=""
 LIBERO_PATH=""
 DRY_RUN=0
+DIAGNOSE_STEPS=0
 EVAL_EXTRA=()
 
 usage() {
@@ -55,6 +56,8 @@ Options:
   --merge-device DEV    cpu (default) or cuda:0 used only while merging
   --rebuild-merge       rebuild --merged even if it already exists
   --mujoco-gl VALUE     egl (default) or osmesa
+  --diagnose N          run N policy steps, dump actions/tokens and print a verdict
+                        (implies --trials 1; see BTKD_DEBUG_ACTIONS in libero_eval_entry.py)
   --python PATH         use this Python instead of activating --env-name
   --libero-path PATH    prepend an existing LIBERO source checkout to PYTHONPATH
   --dry-run             print the commands without running them
@@ -78,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --merge-device)  MERGE_DEVICE="$2"; shift 2 ;;
     --rebuild-merge) REBUILD_MERGE=1; shift ;;
     --mujoco-gl)     MUJOCO_GL_VALUE="$2"; shift 2 ;;
+    --diagnose)      DIAGNOSE_STEPS="$2"; shift 2 ;;
     --python)        PYTHON_BIN="$2"; shift 2 ;;
     --libero-path)   LIBERO_PATH="$2"; shift 2 ;;
     --dry-run)       DRY_RUN=1; shift ;;
@@ -128,6 +132,13 @@ export PYTHONUNBUFFERED=1
 export MUJOCO_GL="${MUJOCO_GL_VALUE}"
 export PYOPENGL_PLATFORM="${MUJOCO_GL_VALUE}"
 export KMP_DUPLICATE_LIB_OK="${KMP_DUPLICATE_LIB_OK:-TRUE}"
+
+if [[ "${DIAGNOSE_STEPS}" != "0" ]]; then
+  export BTKD_DEBUG_ACTIONS=1
+  export BTKD_DEBUG_STEPS="${DIAGNOSE_STEPS}"
+  TRIALS=1
+  echo "[info] diagnose mode: ${DIAGNOSE_STEPS} policy steps, 1 trial, verdict at the end"
+fi
 
 # robosuite 1.4.1 (the version LIBERO pins) compares ``model.jnt_type`` -- a plain int --
 # against members of ``mujoco.mjtJoint``.  Those members were IntEnum (int-comparable) up
